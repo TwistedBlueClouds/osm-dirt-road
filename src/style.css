@@ -89,7 +89,8 @@ code { font-size: 12px; }
 }
 .overlay-tools > * { pointer-events: auto; }
 .slider { display: flex; align-items: center; gap: 6px; font-size: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; }
-.slider input { width: 90px; padding: 0; border: 0; background: none; }
+.slider input[type=checkbox] { width: auto; margin: 0; }
+.slider input[type=range] { width: 90px; padding: 0; border: 0; background: none; }
 #view-hint {
   font-size: 12px; background: rgba(0,0,0,.5); color: #fff; padding: 3px 8px; border-radius: 4px;
 }

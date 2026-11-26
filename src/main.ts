@@ -22,12 +22,13 @@ interface Settings {
   signStyle: SignStyle;
   basemap: Basemap;
   roadOpacity: number;
+  surroundings: boolean;
 }
 const SETTINGS_KEY = 'osm-lanes-3d.settings';
 const DRAFT_KEY = 'osm-lanes-3d.draft';
 
 function loadSettings(): Settings {
-  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85 };
+  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true };
   try {
     return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') };
   } catch {
@@ -62,6 +63,7 @@ const status = (msg: string, error = false) => {
 const view = new MapView($('map'), settings.basemap);
 const scene = new LaneLayer(settings);
 scene.setRoadOpacity(settings.roadOpacity);
+scene.setSurroundingsVisible(settings.surroundings);
 view.ready.then(() => view.map.addLayer(scene));
 view.map.on('click', (e) => {
   if (e.originalEvent.shiftKey) return;
@@ -202,7 +204,7 @@ async function load() {
     selectWay(null);
     refreshCounts();
     const withLanes = Array.from(d.ways.values()).filter((w) => Object.keys(w.tags).some((k) => k.includes(':lanes'))).length;
-    status(`Loaded ${d.ways.size} roads (${withLanes} with per-lane tags)${restored ? `, restored ${restored} unsaved edit(s) from your draft` : ''}.`);
+    status(`Loaded ${d.ways.size} roads (${withLanes} with per-lane tags), ${d.context.buildings.length} buildings, ${d.context.trees.length} trees${restored ? `, restored ${restored} unsaved edit(s) from your draft` : ''}.`);
   } catch (e) {
     status(`Load failed: ${(e as Error).message}`, true);
   } finally {
@@ -221,6 +223,12 @@ $('opacity').addEventListener('input', (e) => {
   settings.roadOpacity = Number((e.target as HTMLInputElement).value);
   saveSettings(settings);
   scene.setRoadOpacity(settings.roadOpacity);
+});
+($('surroundings') as HTMLInputElement).checked = settings.surroundings;
+$('surroundings').addEventListener('change', (e) => {
+  settings.surroundings = (e.target as HTMLInputElement).checked;
+  saveSettings(settings);
+  scene.setSurroundingsVisible(settings.surroundings);
 });
 ($('basemap') as HTMLSelectElement).value = settings.basemap;
 $('basemap').addEventListener('change', (e) => {

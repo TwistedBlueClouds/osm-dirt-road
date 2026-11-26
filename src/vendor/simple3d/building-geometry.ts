@@ -1,0 +1,918 @@
+import * as THREE from 'three';
+import { looseLength, type Heights } from './heights';
+import { skeletonOf, type Skeleton } from './skeleton';
+import { tr } from './i18n';
+import { extendGables, weldRoofSkeleton, restoreRoofBoundary } from './roof-gables';
+
+/** Локальная точка в метрах: x — восток, y — север. */
+export type Pt = [number, number];
+export interface LocalPolygon { outer: Pt[]; inners: Pt[][] }
+
+type V3 = [number, number, number];
+
+/** Треугольники стен и крыши, плоские массивы xyz. */
+export interface BuildingTriangles {
+  walls: number[];
+  roof: number[];
+  /** С какого индекса в walls идут стены крыши (фронтоны), а не фасад; нет — фронтонов не выделяли. */
+  gableStart?: number;
+  /** Форма крыши не поддерживается для этой геометрии и заменена плоской. */
+  roofApproximated: boolean;
+  /** Скелет ещё считается в воркере — крыша временно упрощённая, здание надо будет пересобрать. */
+  pending?: boolean;
+}
+
+const SUPPORTED_ANY_POLYGON = new Set(['flat', 'pyramidal', 'cone', 'dome', 'onion', 'skillion', 'apse_gabled']);
+const SUPPORTED_QUAD = new Set(['gabled', 'hipped']);
+/** Крыши по straight skeleton на контурах любой формы (gabled/hipped на четырёхугольниках — свой код). */
+const SKELETON_SHAPES = new Set(['gabled', 'hipped', 'round', 'gambrel', 'mansard', 'half-hipped', 'saltbox', 'bellcast_gable', 'side_hipped', 'side_half-hipped', 'hipped-and-gabled',
+  'double_saltbox', 'quadruple_saltbox']);
+/** Формы, которые на почти прямоугольных контурах строятся вдоль оси описанного прямоугольника. */
+const AXIS_SHAPES = new Set(['gabled', 'round', 'gambrel', 'half-hipped', 'saltbox', 'bellcast_gable',
+  'side_hipped', 'side_half-hipped', 'hipped-and-gabled', 'crosspitched', 'sawtooth', 'butterfly', 'gabled_row', 'double_saltbox']);
+
+export function buildTriangles(polygons: LocalPolygon[], h: Heights, tags: Record<string, string>): BuildingTriangles {
+  const walls: number[] = [];
+  const roof: number[] = [];
+
+  const shape = h.roofShape;
+  const single = polygons.length === 1 && polygons[0].inners.length === 0 ? polygons[0] : undefined;
+  const quadRoof = single && single.outer.length === 4 && SUPPORTED_QUAD.has(shape) && shape !== 'gabled';
+  // Двускатная и сводчатая на почти прямоугольных контурах — вдоль оси описанного прямоугольника (учитывает roof:orientation)
+  // roof:orientation=across скелет не умеет (у него конёк всегда вдоль) — для неё допускаем контуры кривее:
+  // изогнутая полоса (арка, крыло вдоль дуги) заполняет описанный прямоугольник заметно хуже 85%
+  // Saltbox скелет рисует симметричной двускатной (roof:direction теряется) — для неё тоже допускаем
+  // контуры кривее: way/267152388 с вырезом сбоку заполняет описанный прямоугольник на ~75%
+  const across = tags['roof:orientation'] === 'across' || shape === 'saltbox';
+  // Направление конька задано явно (roof:direction / roof:orientation) — один прямой конёк на любом контуре,
+  // без перехода к скелету: так моделируют двускатные крыши на непрямоугольных основаниях (issue #50)
+  const explicitRidge = !!(tags['roof:direction']?.trim() || tags['roof:orientation']?.trim());
+  const axis = single && AXIS_SHAPES.has(shape)
+    ? rectAxis(single.outer, explicitRidge ? 0 : across ? RECT_FILL_ACROSS : shape === 'crosspitched' ? RECT_FILL_CROSSPITCHED : RECT_FILL)
+    : undefined;
+  // Скатные крыши на остальных контурах (в т.ч. с дырами и из нескольких полигонов) — по straight skeleton;
+  // вальмовые варианты (side_hipped, hipped-and-gabled…) там — упрощённо вальмовой. crosspitched, sawtooth
+  // и butterfly — только на почти прямоугольных контурах, иначе плоская крыша (как неподдерживаемая)
+  const skeletons = !quadRoof && !axis && SKELETON_SHAPES.has(shape) ? polygons.map((p) => skeletonOf(dropCollinear(p.outer), p.inners.map(dropCollinear), GABLED_SHAPES.has(shape))) : undefined;
+  const pending = !!skeletons?.some((sk) => sk === 'pending');
+  const skeletonRoof = !!skeletons?.length && skeletons.every((sk) => sk && sk !== 'pending');
+  const supported =
+    shape === 'flat' ||
+    (shape === 'skillion' && polygons.length === 1) ||
+    (single && SUPPORTED_ANY_POLYGON.has(shape)) ||
+    // Пирамида — на каждом полигоне мультиполигона своя вершина (без внутренних дворов)
+    (shape === 'pyramidal' && polygons.every((p) => p.inners.length === 0)) ||
+    quadRoof ||
+    !!axis ||
+    skeletonRoof;
+  // Неподдерживаемая крыша: стены до самого верха и плоская крыша
+  const wallTop = supported ? h.wallTop : h.top;
+
+  // building:part=steps (вне Simple 3D, но в ходу): односкатная крыша ступенями
+  if (supported && shape === 'skillion' && single && tags['building:part'] === 'steps') {
+    addSteps(walls, roof, single, h, tags['roof:direction'], stepCount(tags, h.roofHeight));
+    return { walls, roof, roofApproximated: false };
+  }
+  if (supported && shape === 'skillion') {
+    addSkillion(walls, roof, polygons[0], h, tags['roof:direction']);
+    return { walls, roof, roofApproximated: false };
+  }
+
+  for (const p of polygons) {
+    for (const ring of [p.outer, ...p.inners]) addWalls(walls, ring, h.min, wallTop);
+  }
+  const gableStart = walls.length;
+
+  if (!supported || shape === 'flat') {
+    for (const p of polygons) addFlat(roof, p, wallTop);
+  } else if (shape === 'pyramidal') {
+    for (const p of polygons) addPyramid(roof, p.outer, h.wallTop, h.top);
+  } else if (shape === 'dome' || shape === 'onion') {
+    addDome(roof, single!.outer, h.wallTop, h.top, shape === 'onion');
+  } else if (shape === 'cone') {
+    for (const p of polygons) addPyramid(roof, p.outer, h.wallTop, h.top);
+  } else if (shape === 'apse_gabled') {
+    addApse(roof, walls, single!.outer, h.wallTop, h.top, tags['roof:direction']);
+  } else if (axis && AXIS_PLANE_SHAPES.has(shape)) {
+    addAxisPlanesRoof(roof, walls, single!.outer, axis, shape, h.wallTop, h.roofHeight, SLOPE_DIRECTION_SHAPES.has(shape) ? gabledAcross(axis, tags) : tags['roof:orientation'] === 'across', tags['roof:direction']);
+  } else if (axis && shape === 'saltbox') {
+    addSaltboxRoof(roof, walls, single!.outer, axis, h.wallTop, h.roofHeight, saltboxAcross(axis, tags), tags['roof:direction']);
+  } else if (axis && shape === 'half-hipped') {
+    addHalfHippedRoof(roof, walls, single!.outer, axis, h.wallTop, h.roofHeight, gabledAcross(axis, tags));
+  } else if (axis) {
+    addAxisRoof(roof, walls, single!.outer, axis, h.wallTop, h.roofHeight, gabledAcross(axis, tags), PROFILES[shape]);
+  } else if (quadRoof) {
+    addQuadRoof(roof, walls, single!.outer, h.wallTop, h.top, shape === 'hipped', tags['roof:orientation'] === 'across');
+  } else {
+    for (const [i, sk] of skeletons!.entries()) addSkeletonRoof(roof, walls, sk as Skeleton, h.wallTop, h.roofHeight, GABLED_SHAPES.has(shape), PROFILES[shape], [polygons[i].outer, ...polygons[i].inners]);
+  }
+
+  return { walls, roof, gableStart, roofApproximated: !supported && !pending, pending };
+}
+
+function tri(out: number[], a: V3, b: V3, c: V3) {
+  out.push(...a, ...b, ...c);
+}
+
+function quad(out: number[], a: V3, b: V3, c: V3, d: V3) {
+  tri(out, a, b, c);
+  tri(out, a, c, d);
+}
+
+function addWalls(out: number[], ring: Pt[], z0: number, z1: number) {
+  if (z1 <= z0) return;
+  for (let i = 0; i < ring.length; i++) {
+    const [ax, ay] = ring[i];
+    const [bx, by] = ring[(i + 1) % ring.length];
+    quad(out, [ax, ay, z0], [bx, by, z0], [bx, by, z1], [ax, ay, z1]);
+  }
+}
+
+function addFlat(out: number[], p: LocalPolygon, z: number) {
+  const contour = p.outer.map(([x, y]) => new THREE.Vector2(x, y));
+  const holes = p.inners.map((r) => r.map(([x, y]) => new THREE.Vector2(x, y)));
+  const all = [contour, ...holes].flat();
+  for (const [a, b, c] of THREE.ShapeUtils.triangulateShape(contour, holes)) {
+    tri(out, [all[a].x, all[a].y, z], [all[b].x, all[b].y, z], [all[c].x, all[c].y, z]);
+  }
+}
+
+/** Дно (плоский низ) объекта — треугольники на высоте z. */
+export function bottomTriangles(polygons: LocalPolygon[], z: number): number[] {
+  const out: number[] = [];
+  for (const p of polygons) addFlat(out, p, z);
+  return out;
+}
+
+function areaCentroid(ring: Pt[]): Pt | undefined {
+  let a = 0, x = 0, y = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const [x0, y0] = ring[i], [x1, y1] = ring[(i + 1) % ring.length];
+    const c = x0 * y1 - x1 * y0;
+    a += c; x += (x0 + x1) * c; y += (y0 + y1) * c;
+  }
+  return Math.abs(a) < 1e-9 ? undefined : [x / (3 * a), y / (3 * a)];
+}
+
+function center(ring: Pt[]): Pt {
+  let x = 0, y = 0;
+  for (const p of ring) { x += p[0]; y += p[1]; }
+  return [x / ring.length, y / ring.length];
+}
+
+function addPyramid(out: number[], ring: Pt[], z0: number, z1: number) {
+  // Центр масс площади, а не среднее вершин: у контуров с неравномерными вершинами (дуги) иначе вершина смещена
+  const [cx, cy] = areaCentroid(ring) ?? center(ring);
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i];
+    const b = ring[(i + 1) % ring.length];
+    tri(out, [a[0], a[1], z0], [b[0], b[1], z0], [cx, cy, z1]);
+  }
+}
+
+/** Излом меньше этого (рад) — та же сторона торца. */
+const APSE_STRAIGHT_RAD = 2 * Math.PI / 180;
+
+/**
+ * Апсида (apse_gabled): полуконус, примыкающий к двускатной крыше. Плоский торец — над самой длинной
+ * стороной контура (вертикальный фронтон), вершина — над её серединой, от неё скаты к остальным сторонам.
+ * roof:direction — куда спускается скат (как у односкатной): торец — на стороне, что смотрит в обратную
+ * сторону; из таких — самая длинная с поправкой на угол (длина × косинус).
+ */
+function addApse(roof: number[], walls: number[], outline: Pt[], z0: number, z1: number, direction?: string) {
+  // Сторона из нескольких отрезков на одной прямой (way/1086428998: узел посередине торца) — одна сторона
+  const straight = outline.filter((p, i) => {
+    const a = outline[(i + outline.length - 1) % outline.length], b = outline[(i + 1) % outline.length];
+    const ux = p[0] - a[0], uy = p[1] - a[1], vx = b[0] - p[0], vy = b[1] - p[1];
+    return Math.abs(Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy)) >= APSE_STRAIGHT_RAD;
+  });
+  const ring = straight.length >= 3 ? straight : outline;
+  const deg = direction === undefined ? NaN : CARDINAL[direction.trim().toUpperCase()] ?? Number(direction);
+  const rad = (deg * Math.PI) / 180;
+  // Торец смотрит против ската; x — восток, y — север
+  const back: Pt | undefined = Number.isFinite(deg) ? [-Math.sin(rad), -Math.cos(rad)] : undefined;
+  let area = 0;
+  for (let i = 0; i < ring.length; i++) { const a = ring[i], b = ring[(i + 1) % ring.length]; area += a[0] * b[1] - b[0] * a[1]; }
+  let k = 0, best = -Infinity;
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const l = Math.hypot(dx, dy);
+    // Внешняя нормаль стороны: у кольца против часовой — справа от направления обхода
+    const score = back && l > 0 ? (area >= 0 ? dy * back[0] - dx * back[1] : dx * back[1] - dy * back[0]) : l;
+    if (score > best) { best = score; k = i; }
+  }
+  const a = ring[k], b = ring[(k + 1) % ring.length];
+  const apex: V3 = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, z1];
+  tri(walls, [a[0], a[1], z0], [b[0], b[1], z0], apex);
+  for (let i = 0; i < ring.length; i++) {
+    if (i === k) continue;
+    const p = ring[i], q = ring[(i + 1) % ring.length];
+    tri(roof, [p[0], p[1], z0], [q[0], q[1], z0], apex);
+  }
+}
+
+/** Купол/луковица: кольца, стягивающиеся к центру. Корректно для выпуклых контуров. */
+function addDome(out: number[], ring: Pt[], z0: number, z1: number, onion: boolean) {
+  const [cx, cy] = center(ring);
+  const steps = 8;
+  const profile = (t: number): [scale: number, z: number] => {
+    const a = (t * Math.PI) / 2;
+    // Луковица сначала расширяется, потом сужается в шпиль
+    const scale = onion ? Math.cos(a) * (1 + 0.35 * Math.sin(a * 2)) : Math.cos(a);
+    return [scale, z0 + (z1 - z0) * (onion ? t : Math.sin(a))];
+  };
+  const ringAt = (s: number, z: number): V3[] => ring.map(([x, y]) => [cx + (x - cx) * s, cy + (y - cy) * s, z]);
+  let prev = ringAt(...profile(0));
+  for (let k = 1; k <= steps; k++) {
+    const cur = ringAt(...profile(k / steps));
+    for (let i = 0; i < ring.length; i++) {
+      const j = (i + 1) % ring.length;
+      quad(out, prev[i], prev[j], cur[j], cur[i]);
+    }
+    prev = cur;
+  }
+}
+
+/** Двускатная/вальмовая крыша на четырёхугольнике. Конёк вдоль длинной стороны (или поперёк при roof:orientation=across). */
+function addQuadRoof(roof: number[], walls: number[], ring: Pt[], z0: number, z1: number, hipped: boolean, across: boolean) {
+  const len = (a: Pt, b: Pt) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+  const along01 = len(ring[0], ring[1]) + len(ring[2], ring[3]) >= len(ring[1], ring[2]) + len(ring[3], ring[0]);
+  // Поворачиваем так, чтобы конёк шёл параллельно ребру p0→p1
+  const r = along01 !== across ? ring : [ring[1], ring[2], ring[3], ring[0]];
+  const [p0, p1, p2, p3] = r.map(([x, y]) => [x, y, z0] as V3);
+  const mid = (a: V3, b: V3): V3 => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, z1];
+  let m1 = mid(p1, p2);
+  let m2 = mid(p3, p0);
+
+  if (hipped) {
+    const ridge = Math.hypot(m1[0] - m2[0], m1[1] - m2[1]);
+    const inset = Math.min((len(r[1], r[2]) + len(r[3], r[0])) / 4, ridge / 2 - 0.01);
+    const dx = (m1[0] - m2[0]) / ridge, dy = (m1[1] - m2[1]) / ridge;
+    m1 = [m1[0] - dx * inset, m1[1] - dy * inset, z1];
+    m2 = [m2[0] + dx * inset, m2[1] + dy * inset, z1];
+  }
+
+  quad(roof, p0, p1, m1, m2);
+  quad(roof, p2, p3, m2, m1);
+  // Торцы: у двускатной — фронтоны (цвет стен), у вальмовой — скаты
+  const ends = hipped ? roof : walls;
+  tri(ends, p1, p2, m1);
+  tri(ends, p3, p0, m2);
+}
+
+/**
+ * Вальмовая или двускатная крыша по straight skeleton: каждая грань скелета — скат над своей стороной контура,
+ * высота точки пропорциональна расстоянию до контура (самая дальняя точка — конёк на высоте roofHeight).
+ * Профиль (round, gambrel, mansard) — высота как функция расстояния до контура; грани режутся на полосы
+ * по точкам излома профиля, внутри полосы высота линейна.
+ * Двускатная: треугольные грани (торцы вальмовой) превращаются во фронтоны — вершина треугольника
+ * переносится на его сторону контура, соседние скаты при этом дотягиваются до торца.
+ */
+function addSkeletonRoof(
+  roof: number[], walls: number[], sk: Skeleton,
+  z0: number, roofHeight: number, gabled: boolean, profile: Profile = LINEAR, rings: Pt[][] = [],
+) {
+  sk = weldRoofSkeleton(sk);
+  const extended = gabled
+    ? extendGables(sk) : { vertices: sk.vertices, polygons: sk.polygons, gables: new Set<number[]>() };
+  const { vertices: verts, polygons } = restoreRoofBoundary(extended, rings);
+  const gables = new Set(polygons.filter((_, i) => extended.gables.has(extended.polygons[i])));
+  const maxT = Math.max(...verts.map((v) => v[2])) || 1;
+
+  const z = (t: number) => z0 + roofHeight * profile.z(Math.min(1, t / maxT));
+  const levels = [0, ...profile.breaks, 1].map((l) => l * maxT);
+  levels[0] = -Infinity;
+  levels[levels.length - 1] = Infinity;
+  for (const f of polygons) {
+    const out = gables.has(f) ? walls : roof;
+    const poly = f.map((i) => verts[i]);
+    // Полосы по «времени» (расстоянию до контура): внутри полосы высота линейна, по полосам — по профилю
+    for (let b = 0; b + 1 < levels.length; b++) {
+      const band = levels.length === 2 ? poly : clipT(clipT(poly, levels[b], 1), levels[b + 1], -1);
+      if (band.length < 3) continue;
+      for (const [p, q, r] of triangulate3(band)) {
+        const a: V3 = [p[0], p[1], z(p[2])], b: V3 = [q[0], q[1], z(q[2])], c: V3 = [r[0], r[1], z(r[2])];
+        // A gable is vertical. Restoring a bent eave can turn part of its
+        // simplified face into a slope (not just a horizontal infill).
+        const u = b.map((v, i) => v - a[i]), v = c.map((v, i) => v - a[i]);
+        const nx = u[1] * v[2] - u[2] * v[1], ny = u[2] * v[0] - u[0] * v[2], nz = u[0] * v[1] - u[1] * v[0];
+        const vertical = Math.abs(nz) <= Math.hypot(nx, ny, nz) * 1e-4;
+        tri(gables.has(f) && !vertical ? roof : out, a, b, c);
+      }
+    }
+  }
+}
+
+/** Порог «почти прямой» стены: излом меньше угла и отклонение меньше расстояния. */
+const COLLINEAR_DEG = 12;
+const COLLINEAR_DIST = 0.5;
+
+/**
+ * Убирает вершины на почти прямых стенах. Иначе скелет делит торец на несколько граней:
+ * фронтоном становится только одна, остальные выходят скатами (у round — «веер» на торце).
+ */
+function dropCollinear(ring: Pt[]): Pt[] {
+  const out = [...ring];
+  for (let changed = true; changed && out.length > 3;) {
+    changed = false;
+    for (let i = 0; i < out.length && out.length > 3; i++) {
+      const a = out[(i + out.length - 1) % out.length], p = out[i], b = out[(i + 1) % out.length];
+      const ux = p[0] - a[0], uy = p[1] - a[1], vx = b[0] - p[0], vy = b[1] - p[1];
+      const turn = Math.abs(Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy)) * 180 / Math.PI;
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+      const dist = Math.abs((b[0] - a[0]) * (a[1] - p[1]) - (a[0] - p[0]) * (b[1] - a[1])) / len;
+      if (turn < COLLINEAR_DEG && dist < COLLINEAR_DIST) { out.splice(i, 1); changed = true; i--; }
+    }
+  }
+  return out;
+}
+
+/** Описанный прямоугольник минимальной площади (по направлениям сторон контура). */
+interface RectAxis { dir: Pt; center: Pt; length: number; width: number }
+
+/** Доля площади описанного прямоугольника, начиная с которой контур считаем «почти прямоугольным». */
+const RECT_FILL = 0.85;
+/** Крестовые крыши часто имеют небольшие выступы на углах: оба корпуса relation/21653288 заполняют ~84%. */
+const RECT_FILL_CROSSPITCHED = 0.83;
+/**
+ * То же для roof:orientation=across: иначе контур уходит в скелет и конёк ложится вдоль. Изогнутые узкие
+ * полосы (рёбра арок, way/1245604260) заполняют описанный прямоугольник меньше чем на 60%.
+ */
+const RECT_FILL_ACROSS = 0.4;
+
+function rectAxis(ring: Pt[], fill = RECT_FILL): RectAxis | undefined {
+  let best: RectAxis & { area: number } | undefined;
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    const l = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (l < 1e-6) continue;
+    const u: Pt = [(b[0] - a[0]) / l, (b[1] - a[1]) / l];
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+    for (const p of ring) {
+      const pu = p[0] * u[0] + p[1] * u[1], pv = -p[0] * u[1] + p[1] * u[0];
+      minU = Math.min(minU, pu); maxU = Math.max(maxU, pu); minV = Math.min(minV, pv); maxV = Math.max(maxV, pv);
+    }
+    const area = (maxU - minU) * (maxV - minV);
+    if (best && area >= best.area) continue;
+    const cu = (minU + maxU) / 2, cv = (minV + maxV) / 2;
+    const center: Pt = [cu * u[0] - cv * u[1], cu * u[1] + cv * u[0]];
+    // dir — вдоль длинной стороны
+    best = maxU - minU >= maxV - minV
+      ? { dir: u, center, length: maxU - minU, width: maxV - minV, area }
+      : { dir: [-u[1], u[0]], center, length: maxV - minV, width: maxU - minU, area };
+  }
+  if (!best) return;
+  let area = 0;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) area += (ring[j][0] - ring[i][0]) * (ring[j][1] + ring[i][1]);
+  return Math.abs(area / 2) >= fill * best.area ? best : undefined;
+}
+
+/**
+ * Двускатная или сводчатая крыша вдоль оси описанного прямоугольника: высота зависит только от расстояния
+ * до конька (по умолчанию вдоль длинной стороны, при roof:orientation=across — поперёк).
+ * Стены по всему контуру поднимаются до поверхности крыши — на торцах получаются фронтоны.
+ */
+function addAxisRoof(
+  roof: number[], walls: number[], ring: Pt[], ax: RectAxis,
+  z0: number, roofHeight: number, across: boolean, profile: Profile = LINEAR,
+) {
+  const n: Pt = across ? ax.dir : [-ax.dir[1], ax.dir[0]]; // поперёк конька
+  const half = (across ? ax.length : ax.width) / 2 || 1;
+  // s — расстояние от конька в долях полуширины, -1…1
+  const sOf = (p: Pt) => ((p[0] - ax.center[0]) * n[0] + (p[1] - ax.center[1]) * n[1]) / half;
+  const z = (sv: number) => {
+    const t = 1 - Math.min(1, Math.abs(sv));
+    return z0 + roofHeight * profile.z(t);
+  };
+  // Полосы симметрично от конька (s = 0) к карнизам (|s| = 1) по точкам излома профиля
+  const fromRidge = profile.breaks.map((b) => 1 - b).sort((a, b) => a - b);
+  const levels = [-Infinity, ...[...fromRidge].reverse().map((l) => -l), 0, ...fromRidge, Infinity];
+  const strips = levels.length - 1;
+
+  const poly: V3[] = ring.map((p) => [p[0], p[1], sOf(p)]);
+  for (let i = 0; i < strips; i++) {
+    const band = clipT(clipT(poly, levels[i], 1), levels[i + 1], -1);
+    if (band.length < 3) continue;
+    const pts = band.map((p) => new THREE.Vector2(p[0], p[1]));
+    for (const [a, b, c] of THREE.ShapeUtils.triangulateShape(pts, [])) {
+      tri(roof, [band[a][0], band[a][1], z(band[a][2])], [band[b][0], band[b][1], z(band[b][2])], [band[c][0], band[c][1], z(band[c][2])]);
+    }
+  }
+
+  // Стены от карниза до крыши: сторону режем на границах полос, чтобы верх стены шёл по профилю
+  const inner = levels.slice(1, -1);
+  for (let i = 0; i < ring.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const cuts = [0, 1];
+    for (const l of inner) {
+      const u = (l - a[2]) / (b[2] - a[2]);
+      if (u > 0 && u < 1) cuts.push(u);
+    }
+    cuts.sort((x, y) => x - y);
+    for (let k = 0; k + 1 < cuts.length; k++) {
+      const p = (u: number): V3 => [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u];
+      const p0 = p(cuts[k]), p1 = p(cuts[k + 1]);
+      const h0 = z(p0[2]), h1 = z(p1[2]);
+      if (h0 - z0 < 1e-6 && h1 - z0 < 1e-6) continue;
+      quad(walls, [p0[0], p0[1], z0], [p1[0], p1[1], z0], [p1[0], p1[1], h1], [p0[0], p0[1], h0]);
+    }
+  }
+}
+
+/** Плоскость z = a·x + b·y + c. */
+type Plane = [a: number, b: number, c: number];
+const planeZ = ([a, b, c]: Plane, x: number, y: number) => a * x + b * y + c;
+
+/** Доля высоты крыши, на которой фронтон полувальмовой крыши срезается вальмой. */
+const HALF_HIP_CUT = 0.6;
+
+/**
+ * Полувальмовая крыша: двускатная, у которой верх фронтонов срезан небольшими вальмами.
+ * Поверхность — минимум из четырёх плоскостей (два ската и две вальмы с тем же уклоном).
+ */
+function addHalfHippedRoof(roof: number[], walls: number[], ring: Pt[], ax: RectAxis, z0: number, roofHeight: number, across: boolean) {
+  const along: Pt = across ? [-ax.dir[1], ax.dir[0]] : ax.dir; // вдоль конька
+  const n: Pt = [-along[1], along[0]]; // поперёк
+  const halfW = (across ? ax.length : ax.width) / 2 || 1;
+  const halfL = (across ? ax.width : ax.length) / 2 || 1;
+  const [cx, cy] = ax.center;
+  const top = z0 + roofHeight;
+  const k = roofHeight / halfW; // уклон скатов, м/м
+  const zc = z0 + roofHeight * HALF_HIP_CUT; // высота среза фронтона
+  // Плоскость, растущая с уклоном k в направлении d от точки (на расстоянии off от центра) с высоты zBase
+  const rising = (d: Pt, off: number, zBase: number): Plane => [k * d[0], k * d[1], zBase - k * (d[0] * cx + d[1] * cy) + k * off];
+  const planes: Plane[] = [
+    rising(n, halfW, z0), // скат со стороны -n: на s = -halfW высота z0
+    rising([-n[0], -n[1]], halfW, z0),
+    rising(along, halfL, zc), // вальма у торца -along: на торце высота zc
+    rising([-along[0], -along[1]], halfL, zc),
+  ];
+  addPlanesRoof(roof, walls, ring, planes, z0, top);
+}
+
+/** Axis-plane roofs with one main ridge whose roof:direction is the slope direction (as for gabled). */
+const SLOPE_DIRECTION_SHAPES = new Set(['hipped-and-gabled', 'butterfly']);
+
+/** Explicit slope direction selects the nearest footprint axis; the ridge is perpendicular to it. */
+function gabledAcross(ax: RectAxis, tags: Record<string, string>): boolean {
+  const direction = tags['roof:direction']?.trim();
+  const deg = direction ? CARDINAL[direction.toUpperCase()] ?? Number(direction) : NaN;
+  if (!Number.isFinite(deg)) return tags['roof:orientation'] === 'across';
+  const rad = deg * Math.PI / 180;
+  const along = Math.sin(rad) * ax.dir[0] + Math.cos(rad) * ax.dir[1];
+  const across = -Math.sin(rad) * ax.dir[1] + Math.cos(rad) * ax.dir[0];
+  return Math.abs(along) > Math.abs(across);
+}
+
+/**
+ * Конёк saltbox поперёк длинной стороны? По roof:orientation, а без него — по roof:direction: длинный скат смотрит
+ * в direction, конёк ему перпендикулярен (иначе направление выбирало бы лишь одну из двух сторон).
+ */
+function saltboxAcross(ax: RectAxis, tags: Record<string, string>): boolean {
+  const o = tags['roof:orientation'];
+  if (o === 'across' || o === 'along') return o === 'across';
+  const v = tags['roof:direction'];
+  const deg = v === undefined ? NaN : CARDINAL[v.toUpperCase()] ?? Number(v);
+  if (!Number.isFinite(deg)) return false;
+  const rad = (deg * Math.PI) / 180;
+  // Скат вдоль оси прямоугольника — конёк поперёк неё
+  return Math.abs(Math.sin(rad) * ax.dir[0] + Math.cos(rad) * ax.dir[1]) > Math.SQRT1_2;
+}
+
+/** Смещение конька saltbox от середины, в долях полуширины. */
+const SALTBOX_RIDGE = 1 / 3;
+
+/**
+ * Saltbox (вики Tag:roof:shape=saltbox): двускатная с коньком, смещённым к одной стороне; скаты одного уклона,
+ * длинный спускается ниже — его карниз на высоте стен, карниз короткого выше (стена с той стороны выше).
+ * Смещение конька теги не задают — берём типичное. roof:direction — куда смотрит длинный скат
+ * (как направление ската у skillion); без него длинный скат — с «левой» стороны оси.
+ */
+function addSaltboxRoof(roof: number[], walls: number[], ring: Pt[], ax: RectAxis, z0: number, roofHeight: number, across: boolean, direction?: string) {
+  const along: Pt = across ? [-ax.dir[1], ax.dir[0]] : ax.dir;
+  let n: Pt = [-along[1], along[0]]; // поперёк конька; длинный скат смотрит в -n
+  const deg = direction === undefined ? NaN : CARDINAL[direction.toUpperCase()] ?? Number(direction);
+  if (Number.isFinite(deg)) {
+    const rad = (deg * Math.PI) / 180;
+    const d: Pt = [Math.sin(rad), Math.cos(rad)]; // x — восток, y — север
+    if (-(n[0] * d[0] + n[1] * d[1]) < 0) n = [-n[0], -n[1]];
+  }
+  const halfW = (across ? ax.length : ax.width) / 2 || 1;
+  const [cx, cy] = ax.center;
+  const ridge = halfW * SALTBOX_RIDGE; // конёк сдвинут в сторону +n
+  const k = roofHeight / (halfW + ridge);
+  // z = z0 + k · (расстояние от карниза), расстояние меряем вдоль d от линии s = -halfW
+  const plane = (d: Pt, k: number): Plane => [k * d[0], k * d[1], z0 - k * (d[0] * cx + d[1] * cy) + k * halfW];
+  // Короткий скат — тот же уклон от конька: его плоскость проходит через конёк (s = ridge) на высоте top
+  const shortPlane: Plane = [-k * n[0], -k * n[1], z0 + roofHeight + k * (n[0] * cx + n[1] * cy) + k * ridge];
+  addPlanesRoof(roof, walls, ring, [plane(n, k), shortPlane], z0, z0 + roofHeight);
+}
+
+/**
+ * Крыша как минимум из плоскостей: контур режется на области, где каждая плоскость ниже остальных
+ * (это пересечение полуплоскостей — каждая область плоская), стены поднимаются до той же поверхности.
+ */
+function addPlanesRoof(
+  roof: number[], walls: number[], ring: Pt[], planes: Plane[], z0: number, cap: number,
+  mode: 'min' | 'max' = 'min', edgeFloor: (a: Pt, b: Pt) => number | undefined = () => z0,
+) {
+  const pick = mode === 'min' ? Math.min : Math.max, sgn = mode === 'min' ? 1 : -1;
+  const zAt = (x: number, y: number) => Math.min(cap, pick(...planes.map((pl) => planeZ(pl, x, y))));
+  for (let i = 0; i < planes.length; i++) {
+    let region: V3[] = ring.map(([x, y]) => [x, y, 0]);
+    for (let j = 0; j < planes.length && region.length >= 3; j++) {
+      if (j === i) continue;
+      // Оставляем точки, где plane_i ≤ plane_j (у max — ≥; третья координата — разность)
+      region = clipT(region.map(([x, y]) => [x, y, sgn * (planeZ(planes[j], x, y) - planeZ(planes[i], x, y))]), 0, 1);
+    }
+    if (region.length < 3) continue;
+    const pts = region.map((p) => new THREE.Vector2(p[0], p[1]));
+    for (const [a, b, c] of THREE.ShapeUtils.triangulateShape(pts, [])) {
+      const v = (k: number): V3 => [region[k][0], region[k][1], Math.min(cap, planeZ(planes[i], region[k][0], region[k][1]))];
+      tri(roof, v(a), v(b), v(c));
+    }
+  }
+  // Стены: режем стороны в точках, где меняется нижняя плоскость, — между разрезами верх стены линеен
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    const floor = edgeFloor(a, b);
+    if (floor === undefined) continue;
+    const cuts = [0, 1];
+    for (let p = 0; p < planes.length; p++) {
+      for (let q = p + 1; q < planes.length; q++) {
+        const da = planeZ(planes[p], ...a) - planeZ(planes[q], ...a);
+        const db = planeZ(planes[p], ...b) - planeZ(planes[q], ...b);
+        if ((da < 0) !== (db < 0) && da !== db) cuts.push(da / (da - db));
+      }
+      // И там, где плоскость пересекает низ стены: стена, поднятая не от карниза (фронтон голландской крыши), —
+      // от точки, где крыша выходит выше её низа
+      const da = planeZ(planes[p], ...a) - floor, db = planeZ(planes[p], ...b) - floor;
+      if (floor > z0 && (da < 0) !== (db < 0) && da !== db) cuts.push(da / (da - db));
+    }
+    cuts.sort((x, y) => x - y);
+    for (let k = 0; k + 1 < cuts.length; k++) {
+      const p0: Pt = [a[0] + (b[0] - a[0]) * cuts[k], a[1] + (b[1] - a[1]) * cuts[k]];
+      const p1: Pt = [a[0] + (b[0] - a[0]) * cuts[k + 1], a[1] + (b[1] - a[1]) * cuts[k + 1]];
+      const h0 = Math.max(floor, zAt(...p0)), h1 = Math.max(floor, zAt(...p1));
+      if (h0 - floor < 1e-6 && h1 - floor < 1e-6) continue;
+      quad(walls, [p0[0], p0[1], floor], [p1[0], p1[1], floor], [p1[0], p1[1], h1], [p0[0], p0[1], h0]);
+    }
+  }
+}
+
+/** Формы, которые строятся из плоскостей вдоль оси описанного прямоугольника (addAxisPlanesRoof). */
+const AXIS_PLANE_SHAPES = new Set(['side_hipped', 'side_half-hipped', 'hipped-and-gabled', 'crosspitched', 'sawtooth', 'butterfly', 'gabled_row']);
+/** hipped-and-gabled: доля высоты крыши, до которой идут вальмы (выше — маленький фронтон). */
+const DUTCH_GABLE_CUT = 0.5;
+/** Пролёт одной двускатной крыши gabled_row в высотах крыши (скаты 45°), не меньше 3 м. */
+const GABLED_ROW_WIDTH = 2;
+/** Зубец sawtooth: ширина в высотах крыши (пологий скат и вертикальный «фонарь»), не меньше 3 м. */
+const SAWTOOTH_WIDTH = 2.5;
+
+/** Часть контура, где f(p) ≥ level (sign=1) или ≤ level (sign=-1). */
+function clipRing(ring: Pt[], f: (p: Pt) => number, level: number, sign: 1 | -1): Pt[] {
+  return clipT(ring.map((p) => [p[0], p[1], f(p)]), level, sign).map(([x, y]) => [x, y]);
+}
+
+/**
+ * Крыши из плоскостей вдоль оси описанного прямоугольника:
+ * - side_hipped / side_half-hipped — двускатная, у которой один торец — вальма (полувальма); вальма — со
+ *   стороны roof:direction, без него — у «начала» оси;
+ * - hipped-and-gabled (голландская) — вальмовая внизу, наверху маленький фронтон;
+ * - crosspitched — два двускатных объёма крест-накрест, фронтоны на всех четырёх сторонах;
+ * - sawtooth — ряд односкатных зубцов (шедовая): коньки вдоль длинной стороны;
+ * - butterfly — обратная двускатная: ендова посередине, карнизы по краям — вверху;
+ * - gabled_row — ряд одинаковых двускатных крыш: коньки поперёк длинной стороны (across — вдоль), фронтоны
+ *   на длинных сторонах; число пролётов — по высоте крыши.
+ */
+function addAxisPlanesRoof(
+  roof: number[], walls: number[], ring: Pt[], ax: RectAxis, shape: string,
+  z0: number, roofHeight: number, across: boolean, direction?: string,
+) {
+  // Both compass labels and numeric bearings select the nearest footprint end.
+  // Keep the ridge aligned with the walls even when the tagged bearing is approximate.
+  if (shape === 'side_hipped' || shape === 'side_half-hipped') {
+    const deg = direction === undefined ? NaN : CARDINAL[direction.toUpperCase()] ?? Number(direction);
+    if (Number.isFinite(deg)) {
+      const rad = deg * Math.PI / 180;
+      const dot = Math.sin(rad) * ax.dir[0] + Math.cos(rad) * ax.dir[1];
+      const cross = -Math.sin(rad) * ax.dir[1] + Math.cos(rad) * ax.dir[0];
+      across = Math.abs(cross) > Math.abs(dot);
+    }
+  }
+  const along: Pt = across ? [-ax.dir[1], ax.dir[0]] : ax.dir; // вдоль конька
+  const n: Pt = [-along[1], along[0]]; // поперёк
+  const halfW = (across ? ax.length : ax.width) / 2 || 1;
+  const halfL = (across ? ax.width : ax.length) / 2 || 1;
+  const [cx, cy] = ax.center;
+  const top = z0 + roofHeight;
+  const k = roofHeight / halfW; // уклон скатов, м/м
+  const u = (p: Pt) => (p[0] - cx) * along[0] + (p[1] - cy) * along[1];
+  const v = (p: Pt) => (p[0] - cx) * n[0] + (p[1] - cy) * n[1];
+  // Плоскость: высота zc в центре, уклон grad (м/м) вдоль d
+  const plane = (d: Pt, grad: number, zc: number): Plane => [grad * d[0], grad * d[1], zc - grad * (d[0] * cx + d[1] * cy)];
+  const neg = (d: Pt): Pt => [-d[0], -d[1]];
+  // Скаты двускатной: на карнизах (v = ±halfW) — z0, на коньке — top
+  const slopes = [plane(n, -k, top), plane(neg(n), -k, top)];
+  // Вальма у торца со стороны -d (на торце высота zEnd), тем же уклоном
+  const hip = (d: Pt, zEnd: number): Plane => plane(d, k, zEnd + k * halfL);
+  const onCut = (f: (p: Pt) => number, level: number) => (a: Pt, b: Pt) => Math.abs(f(a) - level) < 1e-6 && Math.abs(f(b) - level) < 1e-6;
+
+  if (shape === 'side_hipped' || shape === 'side_half-hipped') {
+    let d = along; // вальма — у торца u = -halfL
+    const deg = direction === undefined ? NaN : CARDINAL[direction.toUpperCase()] ?? Number(direction);
+    if (Number.isFinite(deg)) {
+      const rad = (deg * Math.PI) / 180;
+      if (Math.sin(rad) * along[0] + Math.cos(rad) * along[1] > 0) d = neg(along); // вальма смотрит в roof:direction
+    }
+    const zEnd = shape === 'side_hipped' ? z0 : z0 + roofHeight * HALF_HIP_CUT;
+    addPlanesRoof(roof, walls, ring, [...slopes, hip(d, zEnd)], z0, top);
+  } else if (shape === 'hipped-and-gabled') {
+    const zg = z0 + roofHeight * DUTCH_GABLE_CUT;
+    const dg = (zg - z0) / k; // на этом расстоянии от торца вальма доходит до фронтона
+    if (dg >= halfL) { addPlanesRoof(roof, walls, ring, [...slopes, hip(along, z0), hip(neg(along), z0)], z0, top); return; }
+    const cutA = -halfL + dg, cutB = halfL - dg;
+    // Торцы — вальмы до высоты фронтона, середина — двускатная; фронтон — стена на линии раздела выше zg
+    const endA = clipRing(ring, u, cutA, -1), endB = clipRing(ring, u, cutB, 1);
+    const mid = clipRing(clipRing(ring, u, cutA, 1), u, cutB, -1);
+    const cutAEdge = onCut(u, cutA), cutBEdge = onCut(u, cutB);
+    if (endA.length >= 3) addPlanesRoof(roof, walls, endA, [...slopes, hip(along, z0)], z0, top, 'min', (a, b) => (cutAEdge(a, b) ? undefined : z0));
+    if (endB.length >= 3) addPlanesRoof(roof, walls, endB, [...slopes, hip(neg(along), z0)], z0, top, 'min', (a, b) => (cutBEdge(a, b) ? undefined : z0));
+    if (mid.length >= 3) addPlanesRoof(roof, walls, mid, slopes, z0, top, 'min', (a, b) => (cutAEdge(a, b) || cutBEdge(a, b) ? zg : z0));
+  } else if (shape === 'crosspitched') {
+    // Четверти по осям: в каждой — выше из двух скатов (вдоль и поперёк); внутренние линии раздела — без стен
+    const kL = roofHeight / halfL;
+    for (const su of [-1, 1] as const) {
+      for (const sv of [-1, 1] as const) {
+        const q = clipRing(clipRing(ring, u, 0, su), v, 0, sv);
+        if (q.length < 3) continue;
+        const planes = [plane(sv > 0 ? n : neg(n), -k, top), plane(su > 0 ? along : neg(along), -kL, top)];
+        addPlanesRoof(roof, walls, q, planes, z0, top, 'max', (a, b) => (onCut(u, 0)(a, b) || onCut(v, 0)(a, b) ? undefined : z0));
+      }
+    }
+  } else if (shape === 'sawtooth') {
+    const count = Math.max(1, Math.round((2 * halfW) / Math.max(3, SAWTOOTH_WIDTH * roofHeight)));
+    const w = (2 * halfW) / count;
+    for (let i = 0; i < count; i++) {
+      const lo = -halfW + i * w;
+      let strip = ring;
+      if (i > 0) strip = clipRing(strip, v, lo, 1);
+      if (i < count - 1) strip = clipRing(strip, v, lo + w, -1);
+      if (strip.length < 3) continue;
+      // Зубец: от z0 у начала полосы до top у её конца; вертикальная стена «фонаря» — сторона по линии раздела
+      addPlanesRoof(roof, walls, strip, [plane(n, roofHeight / w, z0 - (roofHeight / w) * lo)], z0, top);
+    }
+  } else if (shape === 'butterfly') {
+    addPlanesRoof(roof, walls, ring, [plane(n, k, z0), plane(neg(n), k, z0)], z0, top, 'max');
+  } else if (shape === 'gabled_row') {
+    // Пролёты режут ось along (у across она короткая): коньки идут поперёк неё, по n
+    const count = Math.max(1, Math.round((2 * halfL) / Math.max(3, GABLED_ROW_WIDTH * roofHeight)));
+    const w = (2 * halfL) / count, kr = roofHeight / (w / 2);
+    for (let i = 0; i < count; i++) {
+      const lo = -halfL + i * w;
+      let strip = ring;
+      if (i > 0) strip = clipRing(strip, u, lo, 1);
+      if (i < count - 1) strip = clipRing(strip, u, lo + w, -1);
+      if (strip.length < 3) continue;
+      // Скаты пролёта: от z0 на его краях до top посередине; на ендовах между пролётами стен нет (высота z0)
+      addPlanesRoof(roof, walls, strip, [plane(along, kr, z0 - kr * lo), plane(neg(along), kr, z0 + kr * (lo + w))], z0, top);
+    }
+  }
+}
+
+/** Цилиндрический свод: дуга окружности, t — доля пути от карниза к коньку. */
+/**
+ * Профиль ската: z(t) — доля высоты крыши, t — доля пути от карниза к коньку (0…1).
+ * breaks — точки t, где профиль меняет наклон (по ним режутся полосы).
+ */
+interface Profile { z: (t: number) => number; breaks: number[] }
+
+const LINEAR: Profile = { z: (t) => t, breaks: [] };
+
+/** Ломаная из двух отрезков через (tb, zb). */
+const twoPitch = (tb: number, zb: number): Profile => ({
+  z: (t) => (t <= tb ? (t / tb) * zb : zb + ((t - tb) / (1 - tb)) * (1 - zb)),
+  breaks: [tb],
+});
+
+const ROUND_BANDS = 8;
+/** Доля пути от карниза к середине, где скаты double/quadruple_saltbox выходят на плоский верх. */
+const SALTBOX_FLAT = 0.5;
+
+const PROFILES: Record<string, Profile | undefined> = {
+  // Цилиндрический свод: дуга окружности
+  round: { z: (t) => Math.sqrt(1 - (1 - t) * (1 - t)), breaks: Array.from({ length: ROUND_BANDS - 1 }, (_, i) => (i + 1) / ROUND_BANDS) },
+  // Ломаные крыши: крутой нижний скат и пологий верхний. Пропорции — типичные, теги их не задают
+  gambrel: twoPitch(0.3, 0.7),
+  mansard: twoPitch(0.25, 0.75),
+  // Двускатная с отгибом у карниза (колоколом): пологий низ ската и крутой верх
+  bellcast_gable: twoPitch(0.25, 0.1),
+  // Скаты с плоским верхом (OSM-4D Roof table): double_saltbox — с двух сторон, фронтоны на торцах;
+  // quadruple_saltbox — со всех сторон. Ширину плоского верха теги не задают — типичная
+  double_saltbox: { z: (t) => Math.min(1, t / SALTBOX_FLAT), breaks: [SALTBOX_FLAT] },
+  quadruple_saltbox: { z: (t) => Math.min(1, t / SALTBOX_FLAT), breaks: [SALTBOX_FLAT] },
+};
+
+/** Крыши с фронтонами на торцах (остальные скатные — со скатами со всех сторон). */
+// half-hipped и saltbox на сложных контурах (без оси) — упрощённо как двускатная
+const GABLED_SHAPES = new Set(['gabled', 'round', 'gambrel', 'half-hipped', 'saltbox', 'bellcast_gable', 'double_saltbox']);
+
+/** Отсечение многоугольника по третьей координате: sign=1 — оставить t ≥ level, -1 — t ≤ level. */
+function clipT(poly: V3[], level: number, sign: 1 | -1): V3[] {
+  const out: V3[] = [];
+  const inside = (p: V3) => sign * (p[2] - level) >= -1e-9;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    if (inside(a)) out.push(a);
+    if (inside(a) !== inside(b)) {
+      const u = (level - a[2]) / (b[2] - a[2]);
+      out.push([a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u, level]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Триангуляция плоского многоугольника в 3D (x, y, время): проецируем на плоскость, где он «шире» всего.
+ * Фронтоны вертикальны, поэтому проекции на xy недостаточно.
+ */
+function triangulate3(poly: V3[]): [V3, V3, V3][] {
+  if (poly.length === 3) return [[poly[0], poly[1], poly[2]]];
+  const n = [0, 0, 0];
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    n[0] += (a[1] - b[1]) * (a[2] + b[2]);
+    n[1] += (a[2] - b[2]) * (a[0] + b[0]);
+    n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+  }
+  // Скат — в плане: на проекции вдоль стороны изогнутый карниз (t = 0) лёг бы в прямую и выпал из триангуляции
+  const longest = Math.max(...n.map(Math.abs));
+  const drop = Math.abs(n[2]) > longest * 0.1 ? 2 : n.map(Math.abs).indexOf(longest);
+  const [u, v] = [0, 1, 2].filter((i) => i !== drop);
+  const pts = poly.map((p) => new THREE.Vector2(p[u], p[v]));
+  return THREE.ShapeUtils.triangulateShape(pts, []).map(([a, b, c]) => [poly[a], poly[b], poly[c]]);
+}
+
+const CARDINAL: Record<string, number> = {
+  N: 0, NNE: 22.5, NE: 45, ENE: 67.5, E: 90, ESE: 112.5, SE: 135, SSE: 157.5,
+  S: 180, SSW: 202.5, SW: 225, WSW: 247.5, W: 270, WNW: 292.5, NW: 315, NNW: 337.5,
+};
+
+/**
+ * Односкатная крыша: плоскость, опускающаяся в сторону roof:direction.
+ * Без направления скат идёт перпендикулярно самой длинной стороне контура.
+ */
+function addSkillion(walls: number[], roof: number[], p: LocalPolygon, h: Heights, direction?: string) {
+  const { proj, lo, span } = slope(p.outer, direction);
+  // Дальше по направлению ската — ниже
+  const topAt = (q: Pt) => h.wallTop + h.roofHeight * (1 - (proj(q) - lo) / span);
+
+  for (const ring of [p.outer, ...p.inners]) {
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i], b = ring[(i + 1) % ring.length];
+      quad(walls, [a[0], a[1], h.min], [b[0], b[1], h.min], [b[0], b[1], topAt(b)], [a[0], a[1], topAt(a)]);
+    }
+  }
+  const contour = p.outer.map(([x, y]) => new THREE.Vector2(x, y));
+  const holes = p.inners.map((r) => r.map(([x, y]) => new THREE.Vector2(x, y)));
+  const all = [contour, ...holes].flat();
+  const v = (i: number): V3 => [all[i].x, all[i].y, topAt([all[i].x, all[i].y])];
+  for (const [a, b, c] of THREE.ShapeUtils.triangulateShape(contour, holes)) tri(roof, v(a), v(b), v(c));
+}
+
+/** Направление ската (roof:direction, иначе от самой длинной стороны): проекция на него и её размах по контуру. */
+function slope(ring: Pt[], direction?: string) {
+  let deg = direction === undefined ? NaN : CARDINAL[direction.toUpperCase()] ?? Number(direction);
+  if (!Number.isFinite(deg)) deg = longestEdgeNormal(ring);
+  const rad = (deg * Math.PI) / 180;
+  const dir: Pt = [Math.sin(rad), Math.cos(rad)]; // x — восток, y — север
+  const proj = (q: Pt) => q[0] * dir[0] + q[1] * dir[1];
+  const ps = ring.map(proj);
+  const lo = Math.min(...ps);
+  return { proj, lo, span: Math.max(...ps) - lo || 1 };
+}
+
+/** Высота ступени по умолчанию, м. */
+const STEP_HEIGHT = 0.15;
+
+/** Число ступеней: step_count, иначе по step:height (по умолчанию 15 см). */
+function stepCount(tags: Record<string, string>, rise: number): number {
+  const n = parseInt(tags['step_count'] ?? '', 10);
+  const sh = looseLength(tags['step:height']);
+  const count = n > 0 ? n : Math.round(rise / (sh > 0 ? sh : STEP_HEIGHT));
+  return Math.max(1, Math.min(count, 500));
+}
+
+/**
+ * Ступени (building:part=steps): скат односкатной крыши, разбитый на count ровных проступей. Первая (выше всех) —
+ * у верхнего края ската, последняя — высотой в одну ступень над wallTop; между ними вертикальные подступенки.
+ * Дыры в контуре не поддерживаются (стены по ним — до верха ступени над ними не строим).
+ */
+function addSteps(walls: number[], roof: number[], p: LocalPolygon, h: Heights, direction: string | undefined, count: number) {
+  const { proj, lo, span } = slope(p.outer, direction);
+  const poly: V3[] = p.outer.map((q) => [q[0], q[1], ((proj(q) - lo) / span) * count]);
+  const zOf = (i: number) => (i >= count ? h.min : h.wallTop + (h.roofHeight * (count - i)) / count);
+  const near = (t: number, l: number) => Math.abs(t - l) < 1e-6;
+  for (let i = 0; i < count; i++) {
+    const band = clipT(clipT(poly, i, 1), i + 1, -1);
+    if (band.length < 3) continue;
+    const z = zOf(i);
+    for (const [a, b, c] of triangulate3(band.map((v) => [v[0], v[1], 0] as V3))) tri(roof, [a[0], a[1], z], [b[0], b[1], z], [c[0], c[1], z]);
+    for (let j = 0; j < band.length; j++) {
+      const a = band[j], b = band[(j + 1) % band.length];
+      if (near(a[2], i) && near(b[2], i)) continue; // верхний край — подступенок предыдущей ступени
+      // Нижний край — подступенок до следующей ступени (у последней — до низа); остальное — стена контура
+      const z0 = near(a[2], i + 1) && near(b[2], i + 1) ? zOf(i + 1) : h.min;
+      if (z > z0) quad(walls, [a[0], a[1], z0], [b[0], b[1], z0], [b[0], b[1], z], [a[0], a[1], z]);
+    }
+  }
+}
+
+function longestEdgeNormal(ring: Pt[]): number {
+  let best = 0, deg = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    const l = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (l > best) { best = l; deg = (Math.atan2(b[0] - a[0], b[1] - a[1]) * 180) / Math.PI + 90; }
+  }
+  return deg;
+}
+
+/** Допуск распознавания фигур: углы прямоугольника, °; разброс радиусов и сторон — доля среднего. */
+const SHAPE_ANGLE_DEG = 2, SHAPE_REGULAR = 0.02, SHAPE_CIRCLE = 0.04;
+
+/**
+ * Распознать фигуру контура (кольцо без повтора первой точки): прямоугольник (квадрат), правильный
+ * многоугольник или окружность (много вершин на одинаковом расстоянии от центра — так в OSM рисуют круглые
+ * здания, баки, башни). Центр и подпись для привязки; иначе undefined.
+ */
+export function shapeOf(ring: Pt[]): { c: Pt; label: string; r?: number } | undefined {
+  // Точки на прямой (лишние узлы на сторонах) не считаем вершинами
+  const pts = ring.filter((p, i) => {
+    const a = ring[(i - 1 + ring.length) % ring.length], b = ring[(i + 1) % ring.length];
+    const cr = (p[0] - a[0]) * (b[1] - a[1]) - (p[1] - a[1]) * (b[0] - a[0]);
+    return Math.abs(cr) > 1e-3 * Math.hypot(b[0] - a[0], b[1] - a[1]);
+  });
+  const n = pts.length;
+  if (n < 4) return;
+  const side = (i: number) => Math.hypot(pts[(i + 1) % n][0] - pts[i][0], pts[(i + 1) % n][1] - pts[i][1]);
+  if (n === 4) {
+    const cos = Math.cos((90 - SHAPE_ANGLE_DEG) * Math.PI / 180);
+    for (let i = 0; i < 4; i++) {
+      const a = pts[(i + 3) % 4], o = pts[i], b = pts[(i + 1) % 4];
+      const u = [a[0] - o[0], a[1] - o[1]], v = [b[0] - o[0], b[1] - o[1]];
+      if (Math.abs(u[0] * v[0] + u[1] * v[1]) / (Math.hypot(u[0], u[1]) * Math.hypot(v[0], v[1])) > cos) return;
+    }
+    const c: Pt = [(pts[0][0] + pts[2][0]) / 2, (pts[0][1] + pts[2][1]) / 2];
+    return { c, label: Math.abs(side(0) - side(1)) < SHAPE_REGULAR * (side(0) + side(1)) ? tr('Центр квадрата') : tr('Центр прямоугольника') };
+  }
+  // Центр — центроид площади; радиусы и стороны — разброс относительно среднего
+  let A = 0, cx = 0, cy = 0;
+  for (let i = 0; i < n; i++) {
+    const [x0, y0] = pts[i], [x1, y1] = pts[(i + 1) % n];
+    const k = x0 * y1 - x1 * y0;
+    A += k; cx += (x0 + x1) * k; cy += (y0 + y1) * k;
+  }
+  if (Math.abs(A) < 1e-6) return;
+  const c: Pt = [cx / (3 * A), cy / (3 * A)];
+  const radii = pts.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]));
+  const r = radii.reduce((s, x) => s + x, 0) / n;
+  const spread = (xs: number[], m: number) => Math.max(...xs.map((x) => Math.abs(x - m))) / m;
+  const sides = pts.map((_, i) => side(i));
+  const sMean = sides.reduce((s, x) => s + x, 0) / n;
+  if (spread(radii, r) < SHAPE_REGULAR && spread(sides, sMean) < SHAPE_REGULAR * 2) {
+    return { c, r, label: n >= 12 ? tr('Центр окружности (r {r} м)', { r: r.toFixed(2) }) : tr('Центр {n}-угольника', { n }) };
+  }
+  if (n >= 8 && spread(radii, r) < SHAPE_CIRCLE) return { c, r, label: tr('Центр окружности (r {r} м)', { r: r.toFixed(2) }) };
+  return;
+}
+
+/**
+ * Кровля без стен (building:part=roof, issue #49): скаты, выдавленные вниз на толщину, — копия скатов снизу
+ * и узкие торцы по границе скатов. Фронтонов и стенок под карнизом нет.
+ */
+export function roofShell(roof: number[], thickness: number): number[] {
+  const out: number[] = [];
+  const key = (i: number) => `${roof[i].toFixed(3)},${roof[i + 1].toFixed(3)},${roof[i + 2].toFixed(3)}`;
+  const edges = new Map<string, { a: number; b: number; n: number }>();
+  for (let t = 0; t + 8 < roof.length; t += 9) {
+    const v = [t, t + 3, t + 6];
+    // Низ — та же грань, опущенная и развёрнутая
+    for (const i of [v[0], v[2], v[1]]) out.push(roof[i], roof[i + 1], roof[i + 2] - thickness);
+    for (let k = 0; k < 3; k++) {
+      const a = v[k], b = v[(k + 1) % 3], ka = key(a), kb = key(b);
+      const id = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+      const e = edges.get(id);
+      if (e) e.n++; else edges.set(id, { a, b, n: 1 });
+    }
+  }
+  // Граница скатов — рёбра одного треугольника: по ним торец толщиной в кровлю
+  for (const { a, b, n } of edges.values()) {
+    if (n !== 1) continue;
+    const A = [roof[a], roof[a + 1], roof[a + 2]], B = [roof[b], roof[b + 1], roof[b + 2]];
+    const A2 = [A[0], A[1], A[2] - thickness], B2 = [B[0], B[1], B[2] - thickness];
+    out.push(...A, ...A2, ...B, ...B, ...A2, ...B2);
+  }
+  return out;
+}

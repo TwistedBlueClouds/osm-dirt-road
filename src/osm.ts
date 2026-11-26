@@ -7,6 +7,8 @@ export interface OsmNode {
   lat: number;
   lon: number;
   version: number;
+  /** Only present on tagged nodes (crossings, signals, trees, …). */
+  tags?: Tags;
 }
 
 export interface OsmWay {
@@ -18,9 +20,36 @@ export interface OsmWay {
   origTags: Tags;
 }
 
+export interface OsmRelation {
+  id: number;
+  version: number;
+  tags: Tags;
+  members: { type: 'node' | 'way' | 'relation'; ref: number; role: string }[];
+}
+
+export type LonLat = [number, number];
+
+/** A building or building part footprint. */
+export interface Footprint {
+  tags: Tags;
+  outer: LonLat[];
+  inners: LonLat[][];
+}
+
+/** Read-only surroundings drawn for orientation. */
+export interface Context {
+  buildings: Footprint[];
+  trees: { lon: number; lat: number; tags: Tags }[];
+}
+
 export interface OsmData {
   nodes: Map<number, OsmNode>;
+  /** Editable road ways. */
   ways: Map<number, OsmWay>;
+  /** Every way in the download, roads or not (used for surroundings and street features). */
+  allWays: Map<number, OsmWay>;
+  relations: Map<number, OsmRelation>;
+  context: Context;
 }
 
 export interface BBox {
@@ -68,20 +97,24 @@ function parseOsmXml(text: string): OsmData {
   if (err) throw new Error('Could not parse OSM XML response');
   const nodes = new Map<number, OsmNode>();
   const ways = new Map<number, OsmWay>();
-  doc.querySelectorAll('node').forEach((n) => {
+  const readTags = (el: Element): Tags => {
+    const tags: Tags = {};
+    for (const t of el.children) if (t.tagName === 'tag') tags[t.getAttribute('k')!] = t.getAttribute('v') ?? '';
+    return tags;
+  };
+  doc.querySelectorAll('osm > node').forEach((n) => {
     const id = Number(n.getAttribute('id'));
-    nodes.set(id, {
+    const node: OsmNode = {
       id,
       lat: Number(n.getAttribute('lat')),
       lon: Number(n.getAttribute('lon')),
       version: Number(n.getAttribute('version') ?? 0),
-    });
+    };
+    if (n.children.length) node.tags = readTags(n);
+    nodes.set(id, node);
   });
-  doc.querySelectorAll('way').forEach((w) => {
-    const tags: Tags = {};
-    w.querySelectorAll('tag').forEach((t) => {
-      tags[t.getAttribute('k')!] = t.getAttribute('v') ?? '';
-    });
+  doc.querySelectorAll('osm > way').forEach((w) => {
+    const tags = readTags(w);
     const id = Number(w.getAttribute('id'));
     ways.set(id, {
       id,
@@ -91,19 +124,128 @@ function parseOsmXml(text: string): OsmData {
       origTags: { ...tags },
     });
   });
-  return { nodes, ways };
+  const relations = new Map<number, OsmRelation>();
+  doc.querySelectorAll('osm > relation').forEach((r) => {
+    const id = Number(r.getAttribute('id'));
+    relations.set(id, {
+      id,
+      version: Number(r.getAttribute('version') ?? 0),
+      tags: readTags(r),
+      members: Array.from(r.querySelectorAll('member')).map((m) => ({
+        type: m.getAttribute('type') as 'node' | 'way' | 'relation',
+        ref: Number(m.getAttribute('ref')),
+        role: m.getAttribute('role') ?? '',
+      })),
+    });
+  });
+  return assemble(nodes, ways, relations);
 }
 
-/** Keep only road ways whose nodes are all present. */
-export function filterRoads(data: OsmData): OsmData {
+/** Split a raw download into editable roads and read-only surroundings. */
+export function assemble(nodes: Map<number, OsmNode>, allWays: Map<number, OsmWay>, relations: Map<number, OsmRelation>): OsmData {
   const ways = new Map<number, OsmWay>();
-  for (const w of data.ways.values()) {
+  for (const w of allWays.values()) {
     if (!w.tags.highway || !ROAD_HIGHWAYS.has(w.tags.highway)) continue;
     if (w.tags.area === 'yes') continue;
-    if (!w.nodes.every((id) => data.nodes.has(id))) continue;
+    if (w.nodes.length < 2 || !w.nodes.every((id) => nodes.has(id))) continue;
     ways.set(w.id, w);
   }
-  return { nodes: data.nodes, ways };
+  return { nodes, ways, allWays, relations, context: buildContext(nodes, allWays, relations) };
+}
+
+const isBuilding = (t: Tags) => (t.building !== undefined && t.building !== 'no') || (t['building:part'] !== undefined && t['building:part'] !== 'no');
+
+function buildContext(nodes: Map<number, OsmNode>, ways: Map<number, OsmWay>, relations: Map<number, OsmRelation>): Context {
+  const ringOf = (ids: number[]): LonLat[] | null => {
+    const out: LonLat[] = [];
+    for (const id of ids) {
+      const n = nodes.get(id);
+      if (!n) return null;
+      out.push([n.lon, n.lat]);
+    }
+    return out;
+  };
+  const closed = (w: OsmWay) => w.nodes.length >= 4 && w.nodes[0] === w.nodes[w.nodes.length - 1];
+
+  /** Join member ways end to end into closed rings of node ids. */
+  const joinRings = (members: OsmWay[]): number[][] => {
+    const rings: number[][] = [];
+    const pool = members.map((w) => w.nodes.slice());
+    while (pool.length) {
+      let cur = pool.pop()!;
+      let grew = true;
+      while (cur[0] !== cur[cur.length - 1] && grew) {
+        grew = false;
+        for (let i = 0; i < pool.length; i++) {
+          const c = pool[i];
+          const tail = cur[cur.length - 1];
+          if (c[0] === tail) cur = cur.concat(c.slice(1));
+          else if (c[c.length - 1] === tail) cur = cur.concat(c.slice(0, -1).reverse());
+          else continue;
+          pool.splice(i, 1);
+          grew = true;
+          break;
+        }
+      }
+      if (cur.length >= 4 && cur[0] === cur[cur.length - 1]) rings.push(cur);
+    }
+    return rings;
+  };
+
+  const buildings: Footprint[] = [];
+  const usedAsOuter = new Set<number>();
+  for (const r of relations.values()) {
+    if (r.tags.type !== 'multipolygon' || !isBuilding(r.tags)) continue;
+    const pick = (role: string) => r.members.filter((m) => m.type === 'way' && (m.role === role || (role === 'outer' && m.role === ''))).map((m) => ways.get(m.ref)).filter((w): w is OsmWay => !!w);
+    const outers = joinRings(pick('outer')).map(ringOf).filter((x): x is LonLat[] => !!x);
+    const inners = joinRings(pick('inner')).map(ringOf).filter((x): x is LonLat[] => !!x);
+    r.members.forEach((m) => m.role !== 'inner' && usedAsOuter.add(m.ref));
+    outers.forEach((outer) => buildings.push({ tags: r.tags, outer, inners: inners.filter((h) => pointInRing(h[0], outer)) }));
+  }
+  const trees: Context['trees'] = [];
+  for (const w of ways.values()) {
+    if (isBuilding(w.tags) && closed(w) && !(usedAsOuter.has(w.id) && !w.tags['building:part'])) {
+      const outer = ringOf(w.nodes);
+      if (outer) buildings.push({ tags: w.tags, outer, inners: [] });
+    } else if (w.tags.natural === 'tree_row') {
+      const line = ringOf(w.nodes);
+      if (!line) continue;
+      // One tree roughly every 9 m along the row.
+      for (let i = 1; i < line.length; i++) {
+        const [a, b] = [line[i - 1], line[i]];
+        const metres = Math.hypot((b[0] - a[0]) * 111320 * Math.cos((a[1] * Math.PI) / 180), (b[1] - a[1]) * 110540);
+        const n = Math.max(1, Math.round(metres / 9));
+        for (let k = i === 1 ? 0 : 1; k <= n; k++) {
+          trees.push({ lon: a[0] + ((b[0] - a[0]) * k) / n, lat: a[1] + ((b[1] - a[1]) * k) / n, tags: w.tags });
+        }
+      }
+    }
+  }
+  for (const n of nodes.values()) if (n.tags?.natural === 'tree') trees.push({ lon: n.lon, lat: n.lat, tags: n.tags });
+
+  // Simple 3D Buildings: an outline that contains building parts is not drawn itself.
+  const parts = buildings.filter((b) => b.tags['building:part'] !== undefined);
+  const drawn = buildings.filter((b) => {
+    if (b.tags['building:part'] !== undefined) return true;
+    return !parts.some((p) => pointInRing(centroid(p.outer), b.outer));
+  });
+  return { buildings: drawn, trees };
+}
+
+function centroid(r: LonLat[]): LonLat {
+  let x = 0, y = 0;
+  for (const p of r) { x += p[0]; y += p[1]; }
+  return [x / r.length, y / r.length];
+}
+
+export function pointInRing(p: LonLat, ring: LonLat[]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    if (yi > p[1] !== yj > p[1] && p[0] < ((xj - xi) * (p[1] - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
 }
 
 async function fetchText(url: string, init?: RequestInit): Promise<string> {
@@ -118,7 +260,7 @@ async function fetchText(url: string, init?: RequestInit): Promise<string> {
 /** Authoritative load straight from the OSM editing API (area ≤ 0.25 deg²). */
 export async function loadFromApi(server: ServerConfig, b: BBox): Promise<OsmData> {
   const url = `${server.apiUrl}/api/0.6/map?bbox=${b.west},${b.south},${b.east},${b.north}`;
-  return filterRoads(parseOsmXml(await fetchText(url)));
+  return parseOsmXml(await fetchText(url));
 }
 
 /**
@@ -127,13 +269,14 @@ export async function loadFromApi(server: ServerConfig, b: BBox): Promise<OsmDat
  * on upload rather than silently overwriting someone's edit.
  */
 export async function loadFromOverpass(b: BBox): Promise<OsmData> {
-  const hw = Array.from(ROAD_HIGHWAYS).join('|');
-  const q = `[out:xml][timeout:60];way["highway"~"^(${hw})$"](${b.south},${b.west},${b.north},${b.east});(._;>;);out meta;`;
+  const bb = `(${b.south},${b.west},${b.north},${b.east})`;
+  const q = `[out:xml][timeout:90];(way["highway"]${bb};way["building"]${bb};way["building:part"]${bb};way["natural"="tree_row"]${bb};` +
+    `node["natural"="tree"]${bb};relation["building"]${bb};relation["type"~"^(connectivity|restriction)$"]${bb};way["railway"]${bb};);(._;>>;);out meta;`;
   const text = await fetchText('https://overpass-api.de/api/interpreter', {
     method: 'POST',
     body: new URLSearchParams({ data: q }),
   });
-  return filterRoads(parseOsmXml(text));
+  return parseOsmXml(text);
 }
 
 export function tagsEqual(a: Tags, b: Tags): boolean {

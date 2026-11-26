@@ -7,6 +7,7 @@
 
 import * as THREE from 'three';
 import { MercatorCoordinate, type CustomLayerInterface, type CustomRenderMethodInput, type Map as MlMap } from 'maplibre-gl';
+import { buildBuildings, buildTrees } from './context';
 import { line, pointAt, polyLength, strip, type V2 } from './geom';
 import type { OsmData, OsmWay } from './osm';
 import { layoutLanes, mayChange, parseRoad, type DrivingSide, type LaneSlot } from './lanes';
@@ -77,6 +78,7 @@ export class LaneLayer implements CustomLayerInterface {
   private roads = new THREE.Group();
   private decor = new THREE.Group();
   private highlight = new THREE.Group();
+  private surroundings = new THREE.Group();
   private asphaltMesh: THREE.Mesh | null = null;
   private triWay: Int32Array = new Int32Array(0);
   private triSlot: Int32Array = new Int32Array(0);
@@ -94,7 +96,7 @@ export class LaneLayer implements CustomLayerInterface {
   constructor(opts: SceneOptions) {
     this.opts = opts;
     this.matCentre.color.set(opts.centreLine === 'yellow' ? 0xf2c21b : 0xf2f2ee);
-    this.root.add(this.roads, this.decor, this.highlight);
+    this.root.add(this.surroundings, this.roads, this.decor, this.highlight);
     this.scene.add(this.root);
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x556655, 1.6));
     const sun = new THREE.DirectionalLight(0xffffff, 1.4);
@@ -186,6 +188,25 @@ export class LaneLayer implements CustomLayerInterface {
     }
     this.selected = null;
     this.rebuildAll();
+    this.rebuildSurroundings();
+  }
+
+  private rebuildSurroundings() {
+    this.surroundings.traverse((o) => {
+      if (o instanceof THREE.Mesh) o.geometry.dispose();
+    });
+    this.surroundings.clear();
+    if (!this.data) return;
+    const project = (lat: number, lon: number) => this.project(lat, lon);
+    const b = buildBuildings(this.data.context, project);
+    const t = buildTrees(this.data.context, project);
+    if (b) this.surroundings.add(b);
+    if (t) this.surroundings.add(t);
+  }
+
+  setSurroundingsVisible(on: boolean) {
+    this.surroundings.visible = on;
+    this.repaint();
   }
 
   clear() {
