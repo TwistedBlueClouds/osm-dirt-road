@@ -13,12 +13,15 @@ import { line, pointAt, polyLength, slice, strip, vertexNormals, type V2 } from 
 import { isModified, type OsmData, type OsmWay } from './osm';
 import { connectionCurve, connectionsFrom, solveJunctions, type Arm, type Connection, type WayGeo } from './junctions';
 import { laneKind, layoutLanes, layoutSide, mayChange, parseRoad, type DrivingSide, type LaneSlot, type SideStrip } from './lanes';
+import { BROADLEAF, CARS, CONIFERS, LARGE_VEHICLES, ModelLibrary, hash2, type Placement } from './models';
 import { speedColour } from './speed';
 import { arrowTexture, bikeTexture, roadTextTexture, signFaceTexture, signTexture, signalTexture, type SignStyle } from './textures';
 
 export type ColourBy = 'surface' | 'speed' | 'tags';
 
 export interface SceneOptions {
+  /** Decorative vehicles: parked cars in parking strips and a few in the lanes. */
+  cars?: boolean;
   /** What the lane colours show: the road surface, speed limits, or how completely lanes are tagged. */
   colourBy?: ColourBy;
   /** Sun shadows from buildings, trees, bridges and signs. */
@@ -78,6 +81,8 @@ interface Built {
   triSlot: number[];
   white: number[];
   centre: number[];
+  /** Decorative vehicles on this way. */
+  cars: Placement[];
   /** Bridge decks, parapets, piers and ramp walls. */
   structure: number[];
   /** 1 = normal, lower for tunnels. */
@@ -116,6 +121,8 @@ export class LaneLayer implements CustomLayerInterface {
   private selected: { wayId: number; lane: LaneRef | null } | null = null;
   private hovered: { wayId: number; lane: LaneRef | null } | null = null;
   private hoverGroup = new THREE.Group();
+  private models = new ModelLibrary();
+  private vehicles = new THREE.Group();
   opts: SceneOptions;
 
   private matAsphalt = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.85 });
@@ -145,7 +152,12 @@ export class LaneLayer implements CustomLayerInterface {
   constructor(opts: SceneOptions) {
     this.opts = opts;
     this.matCentre.color.set(opts.centreLine === 'yellow' ? 0xf2c21b : 0xf2f2ee);
-    this.root.add(this.surroundings, this.roads, this.decor, this.highlight, this.hoverGroup);
+    this.root.add(this.surroundings, this.roads, this.vehicles, this.decor, this.highlight, this.hoverGroup);
+    // Models arrive after the first draw; until then trees are simple shapes and there are no cars.
+    void this.models.load().then(() => {
+      this.rebuildSurroundings();
+      this.rebuildVehicles();
+    });
     this.scene.add(this.root);
     this.scene.add(this.hemi, this.sun, this.sun.target);
     this.sun.shadow.mapSize.set(4096, 4096);
@@ -211,6 +223,8 @@ export class LaneLayer implements CustomLayerInterface {
     const texel = (2 * r) / this.sun.shadow.mapSize.x;
     const cx = Math.round(p.x / texel) * texel;
     const cz = Math.round(p.z / texel) * texel;
+    // Offset receivers along their normal by a few texels, or flat roofs stripe (shadow acne).
+    this.sun.shadow.normalBias = Math.max(0.6, texel * 4);
     this.sun.target.position.set(cx, 0, cz);
     // Keep the depth range tight around the scene: it sets the shadow map's precision.
     const dist = r * 2 + 400;
@@ -324,14 +338,18 @@ export class LaneLayer implements CustomLayerInterface {
 
   private rebuildSurroundings() {
     this.surroundings.traverse((o) => {
-      if (o instanceof THREE.Mesh || o instanceof THREE.LineSegments) o.geometry.dispose();
+      // Instanced meshes share the model library's geometry; only free their instance data.
+      if (o instanceof THREE.InstancedMesh) o.dispose();
+      else if (o instanceof THREE.Mesh || o instanceof THREE.LineSegments) o.geometry.dispose();
     });
     this.surroundings.clear();
     this.edges = null;
     if (!this.data) return;
     const project = (lat: number, lon: number) => this.project(lat, lon);
     const b = buildBuildings(this.data.context, project);
-    const t = buildTrees(this.data.context, project);
+    const t = this.models.ready ? this.models.build(this.treePlacements()) : buildTrees(this.data.context, project);
+    const lamps = this.models.ready ? this.models.build(this.lampPlacements()) : null;
+    if (lamps) this.surroundings.add(lamps);
     if (b) {
       b.castShadow = b.receiveShadow = true;
       this.surroundings.add(b);
@@ -348,6 +366,60 @@ export class LaneLayer implements CustomLayerInterface {
       t.traverse((o) => (o.castShadow = true));
       this.surroundings.add(t);
     }
+  }
+
+  private treePlacements(): Placement[] {
+    return this.data!.context.trees.map((t) => {
+      const p = this.project(t.lat, t.lon);
+      const r = hash2(t.lon * 1e4, t.lat * 1e4);
+      const r2 = hash2(t.lat * 1e4, t.lon * 1e4);
+      const tagged = parseFloat(t.tags.height ?? '');
+      const list = t.tags.leaf_type === 'needleleaved' ? CONIFERS : BROADLEAF;
+      return {
+        model: /palm/i.test(t.tags.species ?? t.tags.genus ?? '') ? 'tree-palm' : list[Math.floor(r * list.length)],
+        x: p.x, y: 0, z: p.z, heading: r2 * Math.PI * 2,
+        size: tagged > 1 && tagged < 60 ? tagged : 7 + r2 * 6,
+        shade: r * 2 - 1,
+      };
+    });
+  }
+
+  /** Street lamps from highway=street_lamp nodes, each turned toward the nearest road. */
+  private lampPlacements(): Placement[] {
+    const d = this.data!;
+    const road: { x: number; z: number }[] = [];
+    for (const g of this.geos.values()) for (const p of g.pts) road.push(p);
+    const out: Placement[] = [];
+    for (const n of d.nodes.values()) {
+      if (n.tags?.highway !== 'street_lamp') continue;
+      const p = this.project(n.lat, n.lon);
+      let best = Infinity, bx = 0, bz = 1;
+      for (const q of road) {
+        const dd = (q.x - p.x) ** 2 + (q.z - p.z) ** 2;
+        if (dd < best && dd > 0.01) { best = dd; bx = q.x - p.x; bz = q.z - p.z; }
+      }
+      // The model's arm reaches toward −z.
+      out.push({ model: 'lamp', x: p.x, y: 0, z: p.z, heading: Math.atan2(-bx, -bz) });
+    }
+    return out;
+  }
+
+  private rebuildVehicles() {
+    this.vehicles.traverse((o) => {
+      if (o instanceof THREE.InstancedMesh) o.dispose();
+    });
+    this.vehicles.clear();
+    if (this.models.ready && this.opts.cars !== false) {
+      const all: Placement[] = [];
+      for (const b of this.built.values()) for (const c of b.cars) all.push(c);
+      this.vehicles.add(this.models.build(all));
+    }
+    this.repaint();
+  }
+
+  setCarsVisible(on: boolean) {
+    this.opts.cars = on;
+    this.rebuildVehicles();
   }
 
   setSurroundingsVisible(on: boolean) {
@@ -386,6 +458,7 @@ export class LaneLayer implements CustomLayerInterface {
       }
     }
     this.merge();
+    this.rebuildVehicles();
   }
 
   /**
@@ -452,7 +525,7 @@ export class LaneLayer implements CustomLayerInterface {
     const raised = pts.some((p) => (p.h ?? 0) > 0.05);
     const b: Built = {
       way: w, pts, slots, asphalt: [], triColor: [], triSlot: [],
-      white: [], centre: [], structure: [], alpha: isTunnel(w.tags) ? 0.45 : 1, decor: new THREE.Group(),
+      white: [], centre: [], cars: [], structure: [], alpha: isTunnel(w.tags) ? 0.45 : 1, decor: new THREE.Group(),
     };
     if (pts.length < 2) return b;
 
@@ -499,7 +572,25 @@ export class LaneLayer implements CustomLayerInterface {
             for (let s = 10; s < L - 4; s += 60) this.decal(b, bikeTexture(), pts, s, (st.left + st.right) / 2, 1.1, 2.6);
           } else if (st.kind === 'parking') {
             line(b.white, pts, inner, 0.1, 0.02, [1, 1]);
-            for (let s = 3; s < L - 3; s += 6) strip(b.white, slice(pts, s - 0.05, s + 0.05), st.left, st.right, 0.02);
+            const side = dir === 1 ? (reversed ? 'left' : 'right') : reversed ? 'right' : 'left';
+            const orient = w.tags[`parking:${side}:orientation`] ?? w.tags['parking:both:orientation'] ?? 'parallel';
+            const bay = orient === 'parallel' ? 6 : orient === 'diagonal' ? 3.3 : 2.6;
+            for (let s = bay / 2; s < L - bay / 2; s += bay) {
+              strip(b.white, slice(pts, s - bay / 2 - 0.05, s - bay / 2 + 0.05), st.left, st.right, 0.02);
+              const r = hash2(w.id + s, dir);
+              if (r > 0.72) continue; // some bays are empty
+              const { p, dir: t } = pointAt(pts, s);
+              const mid = (st.left + st.right) / 2;
+              // Parked facing the way traffic on that side travels.
+              const along = (dir === 1) === (this.opts.drivingSide === 'right') || geo.slots.every((x) => x.dir === 'forward') ? 1 : -1;
+              const turn = orient === 'parallel' ? 0 : orient === 'diagonal' ? -dir * Math.PI / 4 : -dir * Math.PI / 2;
+              b.cars.push({
+                model: CARS[Math.floor(hash2(s, w.id) * CARS.length)],
+                x: p.x - t.z * mid, y: p.h ?? 0, z: p.z + t.x * mid,
+                heading: Math.atan2(t.x * along, t.z * along) + turn,
+                shade: r * 2 - 1,
+              });
+            }
           } else if (st.kind === 'shoulder') {
             line(b.white, pts, outer - dir * 0.2, 0.12, 0.02);
           }
@@ -571,6 +662,7 @@ export class LaneLayer implements CustomLayerInterface {
     if (raised && slots.length) buildStructure(b.structure, pts, slots[0].left - 0.35, slots[slots.length - 1].right + 0.35, isBridge(w.tags));
     this.buildArrows(b, L, trim);
     this.buildLaneSymbols(b, L, trim);
+    if (b.alpha === 1 && !unpaved && w.tags.highway !== 'track') this.buildTraffic(b, L);
     this.buildSigns(b, L);
     if (slots.length) this.buildFeatures(b, geo, L);
     return b;
@@ -612,6 +704,31 @@ export class LaneLayer implements CustomLayerInterface {
       if (!positions.length) positions.push(L / 2);
       const lw = s.right - s.left;
       for (const at of positions) this.decal(b, tex, pts, at, ((s.left + s.right) / 2) * sign, Math.min(lw * 0.55, 1.8), 5);
+    }
+  }
+
+  /** A few standing vehicles in the lanes, for scale and to show each lane's direction. */
+  private buildTraffic(b: Built, L: number) {
+    const id = b.way.id;
+    for (const s of b.slots) {
+      if (s.dir === 'both_ways') continue;
+      const kind = laneKind(s.lane, b.way.tags.highway);
+      if (kind !== 'general' && kind !== 'taxi' && kind !== 'hov') continue;
+      const { pts, sign } = this.travel(b, s.dir);
+      const lateral = ((s.left + s.right) / 2) * sign;
+      // Clear of the lettering near the start and the arrows near the end.
+      for (let at = 16 + hash2(id, s.index) * 10, k = 0; at < L - 32; at += 14, k++) {
+        const r = hash2(id * 0.37 + k, s.index + (s.dir === 'forward' ? 0 : 9));
+        if (r > 0.26) continue;
+        const { p, dir } = pointAt(pts, at);
+        const pick = hash2(k, id);
+        b.cars.push({
+          model: kind === 'taxi' ? 'taxi' : pick < 0.12 ? LARGE_VEHICLES[Math.floor(pick / 0.12 * LARGE_VEHICLES.length)] : pick < 0.2 ? 'taxi' : CARS[Math.floor(pick * 97) % CARS.length],
+          x: p.x - dir.z * lateral, y: p.h ?? 0, z: p.z + dir.x * lateral,
+          heading: Math.atan2(dir.x, dir.z),
+          shade: r * 10 - 1,
+        });
+      }
     }
   }
 

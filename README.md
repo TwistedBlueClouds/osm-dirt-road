@@ -22,7 +22,8 @@ over aerial imagery, edit them lane by lane, and upload the result as an OSM cha
 | `bridge`, `layer`, `tunnel` | Raised bridges with decks, parapets and piers, approach ramps that climb to them, faded tunnels |
 | `type=connectivity` relations, or `turn:lanes` and junction shape where none is mapped | Lane connections: arrows from a lane to the lanes it leads into, dashed guide lines for turns through junctions |
 | `surface` | Asphalt, concrete, paving, or a brown dirt/gravel road for unpaved surfaces |
-| `building`, `building:part`, `height`, `building:levels`, `roof:shape`, colours; `natural=tree`, tree rows | Surrounding buildings (Simple 3D Buildings) and trees, for orientation |
+| `building`, `building:part`, `height`, `building:levels`, `roof:shape`, colours; `natural=tree` (with `leaf_type`, `height`), tree rows; `highway=street_lamp` | Surrounding buildings (Simple 3D Buildings), low-poly trees and street lamps, for orientation |
+| `parking:left/right/both` (+ `:orientation`) | Parked cars in the bays. A few vehicles also stand in the lanes for scale and direction; these are decoration, not data (toggle **Cars**) |
 
 Where three or more roads meet, each road is cut back to where its edges meet its neighbours'
 and the junction is filled with a surface with rounded corners.
@@ -114,7 +115,8 @@ settings, and add the Pages URL + `land.html` as a redirect URI on your OAuth ap
 - `src/junctions.ts`: junction cut-backs and surfaces, lane connections
 - `src/elevation.ts`: bridge and ramp heights
 - `src/speed.ts`: speed limit parsing and colours
-- `src/context.ts`: surrounding buildings and trees
+- `src/context.ts`: surrounding buildings and fallback trees
+- `src/models.ts`: low-poly models (cars, trees, street lamps) as instanced meshes
 - `src/mapview.ts`: the map, backgrounds, area selection, zoomed-out road overlay
 - `src/textures.ts`: canvas-drawn arrows, lettering, signs and signals
 - `src/editor.ts`: lane editor side panel
@@ -130,6 +132,8 @@ settings, and add the Pages URL + `land.html` as a redirect URI on your OAuth ap
 - [Lane Studio](https://github.com/MarcelMarzec/LaneStudio) by the Lane Studio contributors
   (ISC, a fork of iD): the lane-type rules follow its model, and its lane types, roadside,
   street features, junctions and connectivity tools were the model for the same features here.
+- Car, tree and street lamp models: [Kenney](https://kenney.nl) asset kits (CC0), see
+  `public/models/kenney/README.md`.
 - Aerial imagery: Esri World Imagery. Map tiles and data © OpenStreetMap contributors.
 
 Map data © OpenStreetMap contributors, ODbL.

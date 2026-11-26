@@ -31,12 +31,13 @@ interface Settings {
   edges: boolean;
   sunHour: number;
   colourBy: ColourBy;
+  cars: boolean;
 }
 const SETTINGS_KEY = 'osm-lanes-3d.settings';
 const DRAFT_KEY = 'osm-lanes-3d.draft';
 
 function loadSettings(): Settings {
-  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true, antialias: true, shadows: true, edges: true, sunHour: 15, colourBy: 'surface' };
+  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true, antialias: true, shadows: true, edges: true, sunHour: 15, colourBy: 'surface', cars: true };
   try {
     return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') };
   } catch {
@@ -485,6 +486,12 @@ $('sun').addEventListener('input', (e) => {
   settings.sunHour = Number((e.target as HTMLInputElement).value);
   saveSettings(settings);
   scene.setSun(settings.sunHour);
+});
+($('cars') as HTMLInputElement).checked = settings.cars;
+$('cars').addEventListener('change', (e) => {
+  settings.cars = (e.target as HTMLInputElement).checked;
+  saveSettings(settings);
+  scene.setCarsVisible(settings.cars);
 });
 ($('surroundings') as HTMLInputElement).checked = settings.surroundings;
 $('surroundings').addEventListener('change', (e) => {

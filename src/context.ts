@@ -27,13 +27,22 @@ function colour(v: string | undefined, def: THREE.Color): THREE.Color {
   return hsl.l < 0.16 ? c.setHSL(hsl.h, hsl.s, 0.16) : c;
 }
 
-/** Vendored geometry is (x east, y north, z up); the scene is (x east, y up, z south). */
-function pushTris(src: number[], pos: number[], col: number[], c: THREE.Color) {
-  // Triangles are emitted with two vertices swapped so the computed normals point outwards
-  // in this frame (shadow biasing relies on that).
+/**
+ * Vendored geometry is (x east, y north, z up); the scene is (x east, y up, z south).
+ * Normals must point outwards for shadow biasing: walls come wound the other way round in
+ * this frame and are flipped; roof triangles are flipped individually so they face up.
+ */
+function pushTris(src: number[], pos: number[], col: number[], c: THREE.Color, roof: boolean) {
   for (let i = 0; i + 8 < src.length; i += 9) {
-    for (const k of [0, 6, 3]) {
-      pos.push(src[i + k], src[i + k + 2], -src[i + k + 1]);
+    // Mapped vertices a, b, c
+    const v = [0, 3, 6].map((k) => [src[i + k], src[i + k + 2], -src[i + k + 1]]);
+    let flip = !roof;
+    if (roof) {
+      const ny = (v[1][2] - v[0][2]) * (v[2][0] - v[0][0]) - (v[1][0] - v[0][0]) * (v[2][2] - v[0][2]);
+      flip = ny < 0;
+    }
+    for (const k of flip ? [0, 2, 1] : [0, 1, 2]) {
+      pos.push(v[k][0], v[k][1], v[k][2]);
       col.push(c.r, c.g, c.b);
     }
   }
@@ -56,8 +65,8 @@ export function buildBuildings(ctx: Context, project: Project): THREE.Mesh | nul
     if (poly.outer.length < 3) continue;
     try {
       const tris = buildTriangles([poly], computeHeights(b.tags), b.tags);
-      pushTris(tris.walls, pos, col, colour(b.tags['building:colour'] ?? b.tags['building:color'], WALL));
-      pushTris(tris.roof, pos, col, colour(b.tags['roof:colour'] ?? b.tags['roof:color'], ROOF));
+      pushTris(tris.walls, pos, col, colour(b.tags['building:colour'] ?? b.tags['building:color'], WALL), false);
+      pushTris(tris.roof, pos, col, colour(b.tags['roof:colour'] ?? b.tags['roof:color'], ROOF), true);
     } catch {
       // A degenerate outline shouldn't take the whole scene down.
     }
