@@ -11,6 +11,7 @@ import { buildBuildings, buildTrees } from './context';
 import { ROAD_GRADE, isBridge, isTunnel, solveHeights } from './elevation';
 import { line, pointAt, polyLength, slice, strip, vertexNormals, type V2 } from './geom';
 import type { OsmData, OsmWay } from './osm';
+import { connectionCurve, connectionsFrom, solveJunctions, type Arm, type Connection, type WayGeo } from './junctions';
 import { laneKind, layoutLanes, layoutSide, mayChange, parseRoad, type DrivingSide, type LaneSlot, type SideStrip } from './lanes';
 import { arrowTexture, bikeTexture, roadTextTexture, signFaceTexture, signTexture, signalTexture, type SignStyle } from './textures';
 
@@ -89,7 +90,10 @@ export class LaneLayer implements CustomLayerInterface {
   private metre = 1;
   private data: OsmData | null = null;
   private built = new Map<number, Built>();
-  private degree = new Map<number, number>();
+  private geos = new Map<number, WayGeo>();
+  private armsAt = new Map<number, Arm[]>();
+  private junctionTris: { pos: number[]; color: THREE.Color }[] = [];
+  private guides: number[] = [];
   private nodeH = new Map<number, number>();
   private roads = new THREE.Group();
   private decor = new THREE.Group();
@@ -105,6 +109,8 @@ export class LaneLayer implements CustomLayerInterface {
   private matWhite = new THREE.MeshBasicMaterial({ color: 0xf2f2ee, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   private matCentre = new THREE.MeshBasicMaterial({ color: 0xf2c21b, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   private matSel = new THREE.MeshBasicMaterial({ color: 0x29b6f6, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+  private matConn = new THREE.MeshBasicMaterial({ color: 0x4dd0e1, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 });
+  private matConnSel = new THREE.MeshBasicMaterial({ color: 0xffb300, transparent: true, opacity: 0.95, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 });
   private matSelLane = new THREE.MeshBasicMaterial({ color: 0xff9800, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
   private matStructure = new THREE.MeshLambertMaterial({ color: 0xb9b6ae, side: THREE.DoubleSide });
   private matPole = new THREE.MeshLambertMaterial({ color: 0x23262a });
@@ -162,6 +168,7 @@ export class LaneLayer implements CustomLayerInterface {
     const hit = ray.intersectObject(this.asphaltMesh, false)[0];
     if (!hit || hit.faceIndex == null) return null;
     const wayId = this.triWay[hit.faceIndex];
+    if (wayId < 0) return null; // junction surface
     const b = this.built.get(wayId);
     const si = this.triSlot[hit.faceIndex];
     return { wayId, slot: b && si >= 0 ? b.slots[si] : null };
@@ -198,13 +205,6 @@ export class LaneLayer implements CustomLayerInterface {
     this.model = new THREE.Matrix4()
       .makeTranslation(this.originMc.x, this.originMc.y, 0)
       .multiply(new THREE.Matrix4().set(m, 0, 0, 0, 0, 0, m, 0, 0, m, 0, 0, 0, 0, 0, 1));
-    this.degree.clear();
-    for (const w of data.ways.values()) {
-      w.nodes.forEach((n, i) => {
-        const inc = i === 0 || i === w.nodes.length - 1 ? 1 : 2;
-        this.degree.set(n, (this.degree.get(n) ?? 0) + inc);
-      });
-    }
     this.nodeH = solveHeights(data);
     this.selected = null;
     this.rebuildAll();
@@ -237,19 +237,52 @@ export class LaneLayer implements CustomLayerInterface {
   private rebuildAll() {
     for (const b of this.built.values()) this.disposeGroup(b.decor);
     this.built.clear();
+    this.geos.clear();
+    this.junctionTris = [];
+    this.guides = [];
     if (!this.data) return;
-    for (const w of this.data.ways.values()) this.built.set(w.id, this.buildWay(w));
+    for (const w of this.data.ways.values()) this.geos.set(w.id, this.prepare(w));
+    const { junctions, armsAt } = solveJunctions(this.geos, this.nodeH);
+    this.armsAt = armsAt;
+    for (const j of junctions) {
+      // Surface like the widest road meeting here.
+      const widest = j.arms.reduce((a, c) => (c.wl + c.wr > a.wl + a.wr ? c : a));
+      this.junctionTris.push({ pos: j.surface, color: surfaceColor(widest.geo.way.tags) });
+    }
+    for (const g of this.geos.values()) this.built.set(g.way.id, this.buildWay(g));
+    // Dashed guide lines for turning movements through junctions.
+    for (const g of this.geos.values()) {
+      for (const c of this.connectionsOf(g.way.id)) {
+        if (c.move === 'through' || c.source === 'default') continue;
+        const curve = connectionCurve(c, this.geos);
+        if (curve) line(this.guides, curve, 0, 0.1, 0.022, [1.2, 1.8]);
+      }
+    }
     this.merge();
   }
 
-  /** Rebuild one way after its tags changed. */
-  updateWay(id: number) {
-    const w = this.data?.ways.get(id);
-    if (!w) return;
-    const old = this.built.get(id);
-    if (old) this.disposeGroup(old.decor);
-    this.built.set(id, this.buildWay(w));
-    this.merge();
+  /**
+   * Rebuild after a way's tags changed. Lane counts and widths change how neighbouring
+   * roads are cut back at junctions, so everything is laid out again.
+   */
+  updateWay(_id?: number) {
+    this.rebuildAll();
+  }
+
+  /** Lane connections out of a way (see junctions.ts). */
+  connectionsOf(wayId: number): Connection[] {
+    const g = this.geos.get(wayId);
+    if (!g || !this.data) return [];
+    return connectionsFrom(g, this.armsAt, this.data.relations.values(), this.opts.drivingSide);
+  }
+
+  getGeo(wayId: number): WayGeo | undefined {
+    return this.geos.get(wayId);
+  }
+
+  /** Is `wayId` one of the roads meeting at `node` with one of its ends? */
+  endsAt(wayId: number, node: number): boolean {
+    return (this.armsAt.get(node) ?? []).some((a) => a.geo.way.id === wayId && !a.through);
   }
 
   private disposeGroup(g: THREE.Object3D) {
@@ -259,23 +292,37 @@ export class LaneLayer implements CustomLayerInterface {
     g.removeFromParent();
   }
 
-  private buildWay(w: OsmWay): Built {
+  /** Geometry and lane layout of a way, before junctions are worked out. */
+  private prepare(w: OsmWay): WayGeo {
     const d = this.data!;
     const model = parseRoad(w.tags);
     let pts: V2[] = w.nodes.map((id) => {
       const n = d.nodes.get(id)!;
       return { ...this.project(n.lat, n.lon), h: this.nodeH.get(id) ?? 0 };
     });
-    const raised = pts.some((p) => (p.h ?? 0) > 0.05);
-    if (raised) pts = densifyRamp(pts);
-    let endNodes = [w.nodes[0], w.nodes[w.nodes.length - 1]];
     const reversed = model.oneway === '-1';
     if (reversed) {
       pts = pts.slice().reverse();
-      endNodes = endNodes.reverse();
       model.oneway = 'yes';
     }
+    let acc = 0;
+    const nodeS = pts.map((p, i) => (i === 0 ? 0 : (acc += Math.hypot(p.x - pts[i - 1].x, p.z - pts[i - 1].z))));
+    if (pts.some((p) => (p.h ?? 0) > 0.05)) pts = densifyRamp(pts);
     const slots = layoutLanes(w.tags, model, this.opts.drivingSide);
+    const ids = reversed ? w.nodes.slice().reverse() : w.nodes;
+    return {
+      way: w, pts, L: polyLength(pts), slots, reversed, nodeS,
+      startNode: ids[0], endNode: ids[ids.length - 1],
+      left: slots[0]?.left ?? 0, right: slots[slots.length - 1]?.right ?? 0,
+      trim: [0, 0], body: pts,
+    };
+  }
+
+  private buildWay(geo: WayGeo): Built {
+    const w = geo.way;
+    const { slots, reversed } = geo;
+    const pts = geo.body;
+    const raised = pts.some((p) => (p.h ?? 0) > 0.05);
     const b: Built = {
       way: w, pts, slots, asphalt: [], triColor: [], triSlot: [],
       white: [], centre: [], structure: [], alpha: isTunnel(w.tags) ? 0.45 : 1, decor: new THREE.Group(),
@@ -330,8 +377,8 @@ export class LaneLayer implements CustomLayerInterface {
     const hasLaneTags = Object.keys(w.tags).some((k) => k === 'lanes' || k.includes(':lanes'));
     const unpaved = (w.tags.surface && UNPAVED.has(w.tags.surface)) || (!w.tags.surface && w.tags.highway === 'track');
     const markings = !unpaved && w.tags.lane_markings !== 'no' && (hasLaneTags || !LOW_CLASS.has(w.tags.highway));
-    const junctionTrim = (n: number) => ((this.degree.get(n) ?? 0) >= 3 ? 4 : 0);
-    const trim: [number, number] = [junctionTrim(endNodes[0]), junctionTrim(endNodes[1])];
+    // Markings stop just short of a junction mouth.
+    const trim: [number, number] = [geo.trim[0] > 0 ? 0.3 : 0, geo.trim[1] > 0 ? 0.3 : 0];
     const fast = FAST.has(w.tags.highway);
     const dash: [number, number] = fast ? [6, 12] : [3, 5];
 
@@ -392,7 +439,7 @@ export class LaneLayer implements CustomLayerInterface {
     this.buildArrows(b, L, trim);
     this.buildLaneSymbols(b, L, trim);
     this.buildSigns(b, L);
-    if (slots.length) this.buildFeatures(b, w, L, reversed, trim);
+    if (slots.length) this.buildFeatures(b, geo, L);
     return b;
   }
 
@@ -461,23 +508,14 @@ export class LaneLayer implements CustomLayerInterface {
   }
 
   /** Crossings, stop and give-way lines, traffic signals and traffic calming along a way. */
-  private buildFeatures(b: Built, w: OsmWay, L: number, reversed: boolean, trim: [number, number]) {
+  private buildFeatures(b: Built, geo: WayGeo, L: number) {
     const d = this.data!;
+    const w = geo.way;
+    const reversed = geo.reversed;
     const pts = b.pts;
     const full: [number, number] = [b.slots[0].left, b.slots[b.slots.length - 1].right];
     const y = 0.021;
-    // Arc length of each way node in drawing direction.
-    let acc = 0;
-    const raw = w.nodes.map((id) => d.nodes.get(id)!);
-    const sAt = raw.map((n, i) => {
-      if (i > 0) {
-        const a = this.project(raw[i - 1].lat, raw[i - 1].lon);
-        const c = this.project(n.lat, n.lon);
-        acc += Math.hypot(c.x - a.x, c.z - a.z);
-      }
-      return acc;
-    });
-    const total = acc || 1;
+    const ids = reversed ? w.nodes.slice().reverse() : w.nodes;
     const bar = (s: number, span: [number, number], width: number) => {
       const a = Math.max(0, s - width / 2), c = Math.min(L, s + width / 2);
       if (c - a > 0.05) strip(b.white, slice(pts, a, c), span[0], span[1], y);
@@ -516,13 +554,14 @@ export class LaneLayer implements CustomLayerInterface {
       b.decor.add(g);
     };
 
-    w.nodes.forEach((id, i) => {
+    ids.forEach((id, i) => {
       const tags = d.nodes.get(id)?.tags;
       if (!tags) return;
-      let s = (reversed ? total - sAt[i] : sAt[i]) * (L / total);
-      const atStart = s < 0.01;
-      const atEnd = s > L - 0.01;
-      const junction = (this.degree.get(id) ?? 0) >= 3;
+      // Position along the trimmed body.
+      let s = Math.min(Math.max(geo.nodeS[i] - geo.trim[0], 0), L);
+      const atStart = i === 0;
+      const atEnd = i === ids.length - 1;
+      const junction = (this.armsAt.get(id)?.length ?? 0) >= 3;
       const toDraw = (v: string | undefined): 'forward' | 'backward' | 'both' | undefined =>
         v === 'forward' || v === 'backward' ? ((v === 'forward') !== reversed ? 'forward' : 'backward') : v === 'both' ? 'both' : undefined;
 
@@ -547,8 +586,8 @@ export class LaneLayer implements CustomLayerInterface {
       if (tags.highway === 'traffic_signals') {
         if (junction && (atStart || atEnd)) {
           // Signals mapped on the junction node: stop the lanes heading into it.
-          if (atEnd) stopFor('forward', L - trim[1] - 0.6, 'signals');
-          else stopFor('backward', trim[0] + 0.6, 'signals');
+          if (atEnd) stopFor('forward', L - 0.7, 'signals');
+          else stopFor('backward', 0.7, 'signals');
         } else if (!hasCrossing) {
           const dir = toDraw(tags['traffic_signals:direction'] ?? tags.direction) ?? 'both';
           if (dir !== 'backward') stopFor('forward', s - 1, 'signals');
@@ -639,6 +678,7 @@ export class LaneLayer implements CustomLayerInterface {
     this.decor.clear();
     let triCount = 0;
     for (const b of this.built.values()) triCount += b.asphalt.length / 9;
+    for (const j of this.junctionTris) triCount += j.pos.length / 9;
     const pos = new Float32Array(triCount * 9);
     const col = new Float32Array(triCount * 12);
     this.triWay = new Int32Array(triCount);
@@ -667,6 +707,17 @@ export class LaneLayer implements CustomLayerInterface {
       for (const v of b.structure) structure.push(v);
       this.decor.add(b.decor);
     }
+    for (const j of this.junctionTris) {
+      pos.set(j.pos, t * 9);
+      const n = j.pos.length / 9;
+      for (let i = 0; i < n; i++) {
+        this.triWay[t + i] = -1;
+        this.triSlot[t + i] = -1;
+        for (let v = 0; v < 3; v++) col.set([j.color.r, j.color.g, j.color.b, 1], (t + i) * 12 + v * 4);
+      }
+      t += n;
+    }
+    for (const v of this.guides) white.push(v);
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setAttribute('color', new THREE.BufferAttribute(col, 4));
@@ -724,6 +775,33 @@ export class LaneLayer implements CustomLayerInterface {
       const hl = new THREE.Mesh(lg, this.matSelLane);
       hl.renderOrder = 1;
       this.highlight.add(hl);
+    }
+    // Where the selected lane (or every lane of the way) leads.
+    const ribbons: number[] = [];
+    const strong: number[] = [];
+    for (const c of this.connectionsOf(this.selected.wayId)) {
+      const curve = connectionCurve(c, this.geos);
+      if (!curve) continue;
+      const mine = s && c.from.dir === s.dir && c.from.index === s.index;
+      if (s && !mine) continue;
+      const out = mine ? strong : ribbons;
+      strip(out, curve, -0.22, 0.22, 0.04);
+      // Arrow head
+      const a = curve[curve.length - 2];
+      const e = curve[curve.length - 1];
+      const dl = Math.hypot(e.x - a.x, e.z - a.z) || 1;
+      const dx = (e.x - a.x) / dl, dz = (e.z - a.z) / dl;
+      const y = (e.h ?? 0) + 0.04;
+      out.push(e.x + dx * 1.4, y, e.z + dz * 1.4, e.x - dz * 0.7, y, e.z + dx * 0.7, e.x + dz * 0.7, y, e.z - dx * 0.7);
+    }
+    for (const [arr, mat] of [[ribbons, this.matConn], [strong, this.matConnSel]] as const) {
+      if (!arr.length) continue;
+      const cg = new THREE.BufferGeometry();
+      cg.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
+      const cm = new THREE.Mesh(cg, mat);
+      cm.renderOrder = 4;
+      cm.frustumCulled = false;
+      this.highlight.add(cm);
     }
   }
 

@@ -1,7 +1,7 @@
 // OAuth2 login (osm-auth) and changeset upload.
 
 import { osmAuth } from 'osm-auth';
-import { applyDiffResult, buildChangesetXml, buildOsmChange, type OsmData, type OsmWay, type ServerConfig, type Tags } from './osm';
+import { applyDiffResult, buildChangesetXml, buildOsmChange, type OsmData, type OsmRelation, type OsmWay, type ServerConfig, type Tags } from './osm';
 
 const CLIENT_KEY = 'osm-lanes-3d.clientId.';
 
@@ -88,8 +88,8 @@ export class Uploader {
   }
 
   /** Create changeset, upload the diff, close it. Returns the changeset id. */
-  async upload(ways: OsmWay[], data: OsmData, changesetTags: Tags, onStep: (s: string) => void): Promise<number> {
-    if (!ways.length) throw new Error('Nothing to upload');
+  async upload(ways: OsmWay[], relations: OsmRelation[], data: OsmData, changesetTags: Tags, onStep: (s: string) => void): Promise<number> {
+    if (!ways.length && !relations.length) throw new Error('Nothing to upload');
     if (!this.authenticated()) {
       onStep('Signing in…');
       await this.login();
@@ -97,8 +97,8 @@ export class Uploader {
     onStep('Opening changeset…');
     const id = Number(await this.call('PUT', '/api/0.6/changeset/create', buildChangesetXml(changesetTags)));
     try {
-      onStep(`Uploading ${ways.length} way${ways.length > 1 ? 's' : ''} to changeset ${id}…`);
-      const result = await this.call('POST', `/api/0.6/changeset/${id}/upload`, buildOsmChange(ways, id));
+      onStep(`Uploading ${ways.length + relations.length} change${ways.length + relations.length > 1 ? 's' : ''} to changeset ${id}…`);
+      const result = await this.call('POST', `/api/0.6/changeset/${id}/upload`, buildOsmChange(ways, id, relations));
       applyDiffResult(result, data);
     } finally {
       onStep('Closing changeset…');

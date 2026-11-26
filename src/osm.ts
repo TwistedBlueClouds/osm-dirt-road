@@ -24,7 +24,17 @@ export interface OsmRelation {
   id: number;
   version: number;
   tags: Tags;
-  members: { type: 'node' | 'way' | 'relation'; ref: number; role: string }[];
+  members: RelMember[];
+  /** State on the server; null for a relation created in this session. */
+  orig: { tags: Tags; members: RelMember[] } | null;
+  /** Marked for deletion on upload. */
+  deleted?: boolean;
+}
+
+export interface RelMember {
+  type: 'node' | 'way' | 'relation';
+  ref: number;
+  role: string;
 }
 
 export type LonLat = [number, number];
@@ -127,15 +137,15 @@ function parseOsmXml(text: string): OsmData {
   const relations = new Map<number, OsmRelation>();
   doc.querySelectorAll('osm > relation').forEach((r) => {
     const id = Number(r.getAttribute('id'));
+    const tags = readTags(r);
+    const members: RelMember[] = Array.from(r.querySelectorAll('member')).map((m) => ({
+      type: m.getAttribute('type') as RelMember['type'],
+      ref: Number(m.getAttribute('ref')),
+      role: m.getAttribute('role') ?? '',
+    }));
     relations.set(id, {
-      id,
-      version: Number(r.getAttribute('version') ?? 0),
-      tags: readTags(r),
-      members: Array.from(r.querySelectorAll('member')).map((m) => ({
-        type: m.getAttribute('type') as 'node' | 'way' | 'relation',
-        ref: Number(m.getAttribute('ref')),
-        role: m.getAttribute('role') ?? '',
-      })),
+      id, version: Number(r.getAttribute('version') ?? 0), tags, members,
+      orig: { tags: { ...tags }, members: members.map((m) => ({ ...m })) },
     });
   });
   return assemble(nodes, ways, relations);
@@ -322,22 +332,40 @@ function tagXml(tags: Tags, indent: string): string {
 
 const GENERATOR = 'OSM Lanes 3D';
 
-/** osmChange document for all modified ways (tag-only edits). */
-export function buildOsmChange(ways: OsmWay[], changesetId: number | string): string {
-  const body = ways
-    .map((w) => {
-      const nds = w.nodes.map((n) => `      <nd ref="${n}"/>`).join('\n');
-      return `    <way id="${w.id}" version="${w.version}" changeset="${changesetId}">\n${nds}\n${tagXml(w.tags, '      ')}\n    </way>`;
-    })
-    .join('\n');
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<osmChange version="0.6" generator="${GENERATOR}">\n  <modify>\n${body}\n  </modify>\n</osmChange>\n`;
+export function isRelationModified(r: OsmRelation): boolean {
+  if (!r.orig) return !r.deleted;
+  if (r.deleted) return true;
+  return !tagsEqual(r.tags, r.orig.tags) || JSON.stringify(r.members) !== JSON.stringify(r.orig.members);
+}
+
+/** osmChange document: modified ways (tags only) plus created / modified / deleted relations. */
+export function buildOsmChange(ways: OsmWay[], changesetId: number | string, relations: OsmRelation[] = []): string {
+  const wayXml = (w: OsmWay) => {
+    const nds = w.nodes.map((n) => `      <nd ref="${n}"/>`).join('\n');
+    return `    <way id="${w.id}" version="${w.version}" changeset="${changesetId}">\n${nds}\n${tagXml(w.tags, '      ')}\n    </way>`;
+  };
+  const relXml = (r: OsmRelation, body = true) => {
+    const head = `    <relation id="${r.id}" version="${r.version}" changeset="${changesetId}"`;
+    if (!body) return `${head}/>`;
+    const ms = r.members.map((m) => `      <member type="${m.type}" ref="${m.ref}" role="${esc(m.role)}"/>`).join('\n');
+    return `${head}>\n${ms}\n${tagXml(r.tags, '      ')}\n    </relation>`;
+  };
+  const created = relations.filter((r) => !r.orig && !r.deleted);
+  const deleted = relations.filter((r) => r.orig && r.deleted);
+  const modified = relations.filter((r) => r.orig && !r.deleted && isRelationModified(r));
+  const block = (name: string, items: string[]) => (items.length ? `  <${name}>\n${items.join('\n')}\n  </${name}>\n` : '');
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<osmChange version="0.6" generator="${GENERATOR}">\n` +
+    block('create', created.map((r) => relXml(r))) +
+    block('modify', [...ways.map(wayXml), ...modified.map((r) => relXml(r))]) +
+    block('delete', deleted.map((r) => relXml(r, false))) +
+    `</osmChange>\n`;
 }
 
 export function buildChangesetXml(tags: Tags): string {
   return `<?xml version="1.0" encoding="UTF-8"?>\n<osm>\n  <changeset>\n${tagXml(tags, '    ')}\n  </changeset>\n</osm>\n`;
 }
 
-/** Apply new versions from a diffResult so further uploads don't conflict. */
+/** Apply new ids / versions from a diffResult so further uploads don't conflict. */
 export function applyDiffResult(xml: string, data: OsmData): void {
   const doc = new DOMParser().parseFromString(xml, 'application/xml');
   doc.querySelectorAll('way').forEach((el) => {
@@ -348,5 +376,20 @@ export function applyDiffResult(xml: string, data: OsmData): void {
       w.version = Number(v);
       w.origTags = { ...w.tags };
     }
+  });
+  doc.querySelectorAll('relation').forEach((el) => {
+    const oldId = Number(el.getAttribute('old_id'));
+    const r = data.relations.get(oldId);
+    if (!r) return;
+    const newId = el.getAttribute('new_id');
+    if (!newId) {
+      data.relations.delete(oldId); // deleted
+      return;
+    }
+    data.relations.delete(oldId);
+    r.id = Number(newId);
+    r.version = Number(el.getAttribute('new_version') ?? r.version);
+    r.orig = { tags: { ...r.tags }, members: r.members.map((m) => ({ ...m })) };
+    data.relations.set(r.id, r);
   });
 }

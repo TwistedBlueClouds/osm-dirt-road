@@ -50,6 +50,10 @@ export class LaneEditor {
   /** Called when the user clicks a lane column. */
   onFocusLane: (ref: LaneRef | null) => void = () => {};
   onRevert: (wayId: number) => void = () => {};
+  /** Called when the user asks to edit a lane's connections. */
+  onConnect: (ref: LaneRef) => void = () => {};
+  /** Lane whose connections are being edited (button shown active). */
+  connecting: LaneRef | null = null;
   server: ServerConfig | null = null;
 
   constructor(private root: HTMLElement) {
@@ -188,6 +192,7 @@ export class LaneEditor {
         <div class="lane-h" data-act="focus">
           <span>Lane ${i + 1}</span>
           ${removable ? `<span class="tools">
+            <button data-act="connect" class="${this.connecting && this.connecting.dir === dir && this.connecting.index === i ? 'on' : ''}" title="Connect: choose which lanes this lane leads into at the junction">⇢</button>
             <button data-act="ins-left" title="Insert a lane to the left">+◂</button>
             <button data-act="ins-right" title="Insert a lane to the right">▸+</button>
             <button data-act="del" title="Remove this lane">✕</button></span>` : ''}
@@ -243,6 +248,9 @@ export class LaneEditor {
         this.root.querySelectorAll('.lane.focused').forEach((x) => x.classList.remove('focused'));
         card?.classList.add('focused');
         this.onFocusLane(this.focus);
+        return;
+      case 'connect':
+        if (dir && dir !== 'both_ways') this.onConnect({ dir, index: i });
         return;
       case 'revert':
         this.onRevert(this.way.id);

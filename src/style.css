@@ -195,3 +195,5 @@ dialog label > input, dialog label > select, dialog label > textarea { display: 
 .lane.side .check { margin-top: 8px; color: var(--ink); }
 .lane.side label.check { display: flex; align-items: center; gap: 6px; }
 .lane.side label.check input { width: auto; margin: 0; }
+.lane-h .tools button.on { background: var(--focus); color: #000; border-color: var(--focus); }
+body.connecting #status { color: var(--accent); font-weight: 600; }

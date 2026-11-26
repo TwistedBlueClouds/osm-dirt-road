@@ -3,11 +3,12 @@ import { MapView, type Basemap } from './mapview';
 import { LaneLayer } from './lanelayer';
 import { LaneEditor, type LaneRef } from './editor';
 import {
-  API_MAX_AREA, SERVERS, bboxArea, buildOsmChange, diffTags, isModified, loadFromApi, loadFromOverpass,
-  tagsEqual, type BBox, type OsmData, type OsmWay, type Tags,
+  API_MAX_AREA, SERVERS, bboxArea, buildOsmChange, diffTags, isModified, isRelationModified, loadFromApi, loadFromOverpass,
+  tagsEqual, type BBox, type OsmData, type OsmRelation, type OsmWay, type Tags,
 } from './osm';
 import { Uploader, getClientId, redirectUri, setClientId } from './upload';
 import type { DrivingSide } from './lanes';
+import { findConnectivityRelation, formatConnectivity, travelLanes, type LaneId } from './junctions';
 import type { SignStyle } from './textures';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -52,7 +53,12 @@ let uploader = new Uploader(SERVERS[settings.server], settings.server);
 let data: OsmData | null = null;
 let selectedId: number | null = null;
 let selectedLane: LaneRef | null = null;
-const undoStack: { wayId: number; tags: Tags }[] = [];
+type RelSnapshot = Pick<OsmRelation, 'tags' | 'members' | 'deleted'> | null;
+type UndoEntry = { wayId: number; tags: Tags } | { relId: number; before: RelSnapshot; wayId: number };
+const undoStack: UndoEntry[] = [];
+/** Lane whose connections are being edited by clicking target lanes. */
+let connectFrom: { wayId: number; lane: LaneRef } | null = null;
+let nextNewId = -1;
 
 const status = (msg: string, error = false) => {
   const el = $('status');
@@ -68,6 +74,11 @@ view.ready.then(() => view.map.addLayer(scene));
 view.map.on('click', (e) => {
   if (e.originalEvent.shiftKey) return;
   const pick = scene.pick(e.point.x, e.point.y);
+  if (connectFrom) {
+    if (pick?.slot && pick.slot.dir !== 'both_ways') toggleConnection({ wayId: pick.wayId, dir: pick.slot.dir, index: pick.slot.index });
+    else status('Click a lane on a road leaving the junction (Esc to finish).');
+    return;
+  }
   if (pick) selectWay(pick.wayId, pick.slot ? { dir: pick.slot.dir, index: pick.slot.index } : null, false);
 });
 view.onOverlayClick = (id) => {
@@ -78,6 +89,8 @@ editor.server = SERVERS[settings.server];
 editor.show(null);
 
 function selectWay(id: number | null, lane: LaneRef | null = null, fly = true) {
+  if (connectFrom) setConnectMode(null);
+  editor.connecting = null;
   selectedId = id;
   selectedLane = lane;
   view.select(id);
@@ -87,6 +100,16 @@ function selectWay(id: number | null, lane: LaneRef | null = null, fly = true) {
   const frame = id != null && fly ? scene.wayFrame(id) : null;
   if (frame) view.focus(frame);
 }
+
+editor.onConnect = (ref) => {
+  if (selectedId == null || !ref) return;
+  const same = connectFrom && connectFrom.wayId === selectedId && connectFrom.lane.dir === ref.dir && connectFrom.lane.index === ref.index;
+  setConnectMode(same ? null : { wayId: selectedId, lane: ref });
+  selectedLane = ref;
+  scene.select(selectedId, ref);
+  editor.connecting = connectFrom?.lane ?? null;
+  editor.show(data?.ways.get(selectedId) ?? null, ref);
+};
 
 editor.onFocusLane = (ref) => {
   selectedLane = ref;
@@ -116,9 +139,18 @@ editor.onRevert = (id) => {
 
 function undo() {
   const e = undoStack.pop();
-  if (!e) return;
-  setTags(e.wayId, e.tags, false);
-  if (selectedId !== e.wayId) selectWay(e.wayId);
+  if (!e || !data) return;
+  if ('relId' in e) {
+    if (e.before) {
+      const r = data.relations.get(e.relId);
+      if (r) Object.assign(r, { tags: e.before.tags, members: e.before.members, deleted: e.before.deleted });
+    } else data.relations.delete(e.relId);
+    scene.updateWay();
+    scene.select(selectedId, selectedLane);
+  } else {
+    setTags(e.wayId, e.tags, false);
+    if (selectedId !== e.wayId) selectWay(e.wayId);
+  }
   refreshCounts();
 }
 
@@ -126,8 +158,76 @@ function modifiedWays(): OsmWay[] {
   return data ? Array.from(data.ways.values()).filter(isModified) : [];
 }
 
+function modifiedRelations(): OsmRelation[] {
+  return data ? Array.from(data.relations.values()).filter(isRelationModified) : [];
+}
+
+// ---------------------------------------------------------------------------
+// Lane connections (type=connectivity relations)
+
+function setConnectMode(from: { wayId: number; lane: LaneRef } | null) {
+  connectFrom = from;
+  view.map.getCanvas().style.cursor = from ? 'cell' : '';
+  document.body.classList.toggle('connecting', !!from);
+  if (from) status('Connecting lanes: click each lane this lane leads into (click again to remove). Esc to finish.');
+}
+
+/** Add or remove a connection from the lane being edited to `to`, writing the relation. */
+function toggleConnection(to: LaneId) {
+  if (!data || !connectFrom || connectFrom.lane.dir === 'both_ways') return;
+  const from: LaneId = { wayId: connectFrom.wayId, dir: connectFrom.lane.dir, index: connectFrom.lane.index };
+  const fromGeo = scene.getGeo(from.wayId);
+  const toGeo = scene.getGeo(to.wayId);
+  if (!fromGeo || !toGeo) return;
+  // The lane arrives at the end of the way it travels toward.
+  const via = from.dir === 'forward' ? fromGeo.endNode : fromGeo.startNode;
+  const leaves = (to.dir === 'forward' ? toGeo.startNode : toGeo.endNode) === via;
+  if (to.wayId === from.wayId || !leaves || !scene.endsAt(to.wayId, via)) {
+    status('That lane does not leave the junction this lane arrives at. Pick a lane on a road that starts at the same junction.', true);
+    return;
+  }
+  // Current connections for this from → to pair (mapped or worked out), as OSM lane numbers.
+  const current = new Map<number, number[]>();
+  const number = (g: typeof fromGeo, dir: 'forward' | 'backward', index: number) => travelLanes(g, dir).findIndex((s) => s.index === index) + 1;
+  for (const c of scene.connectionsOf(from.wayId)) {
+    if (c.via !== via || c.to.wayId !== to.wayId || c.from.dir !== from.dir) continue;
+    const f = number(fromGeo, c.from.dir, c.from.index);
+    current.set(f, [...(current.get(f) ?? []), number(toGeo, c.to.dir, c.to.index)]);
+  }
+  const f = number(fromGeo, from.dir, from.index);
+  const t = number(toGeo, to.dir, to.index);
+  const list = current.get(f) ?? [];
+  const adding = !list.includes(t);
+  current.set(f, adding ? [...list, t] : list.filter((x) => x !== t));
+  const value = formatConnectivity(current);
+
+  let rel = findConnectivityRelation(data.relations.values(), from.wayId, via, to.wayId);
+  const snap = (r: OsmRelation): RelSnapshot => ({ tags: { ...r.tags }, members: r.members.map((x) => ({ ...x })), deleted: r.deleted });
+  if (!rel) {
+    rel = {
+      id: nextNewId--, version: 0, orig: null,
+      tags: { type: 'connectivity', connectivity: value },
+      members: [{ type: 'way', ref: from.wayId, role: 'from' }, { type: 'node', ref: via, role: 'via' }, { type: 'way', ref: to.wayId, role: 'to' }],
+    };
+    data.relations.set(rel.id, rel);
+    undoStack.push({ relId: rel.id, before: null, wayId: from.wayId });
+  } else {
+    undoStack.push({ relId: rel.id, before: snap(rel), wayId: from.wayId });
+    rel.tags = { ...rel.tags, connectivity: value };
+  }
+  if (!value) {
+    // Nothing connects any more: an empty connectivity relation is meaningless.
+    if (rel.orig) rel.deleted = true;
+    else data.relations.delete(rel.id);
+  }
+  scene.updateWay();
+  scene.select(selectedId, selectedLane);
+  refreshCounts();
+  status(`${adding ? 'Connected' : 'Disconnected'} lane ${f} → lane ${t}. connectivity=${value || '(none)'}`);
+}
+
 function refreshCounts() {
-  const n = modifiedWays().length;
+  const n = modifiedWays().length + modifiedRelations().length;
   $('n-changes').textContent = String(n);
   ($('btn-upload') as HTMLButtonElement).disabled = n === 0;
   ($('btn-undo') as HTMLButtonElement).disabled = undoStack.length === 0;
@@ -244,13 +344,17 @@ document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !typing) {
     e.preventDefault();
     undo();
+  } else if (e.key === 'Escape' && connectFrom) {
+    setConnectMode(null);
+    status('Finished connecting lanes.');
+    if (selectedId != null) editor.show(data?.ways.get(selectedId) ?? null, selectedLane);
   } else if (e.key === 'Escape' && !typing && !document.querySelector('dialog[open]')) {
     selectWay(null);
   }
 });
 
 window.addEventListener('beforeunload', (e) => {
-  if (modifiedWays().length) e.preventDefault();
+  if (modifiedWays().length || modifiedRelations().length) e.preventDefault();
 });
 
 // ---------------------------------------------------------------------------
@@ -385,14 +489,19 @@ $('btn-upload').addEventListener('click', () => {
     <div class="diff">${diffTags(w.origTags, w.tags).map((d) => `
       <div class="${d.before === undefined ? 'add' : d.after === undefined ? 'del' : 'mod'}"><code>${esc(d.key)}</code>
       ${d.before !== undefined ? `<s>${esc(d.before)}</s>` : ''}${d.after !== undefined ? ` → <b>${esc(d.after)}</b>` : ' (removed)'}</div>`).join('')}
-    </div>`).join('');
+    </div>`).join('') + modifiedRelations().map((r) => `
+    <h4>Lane connection <small>relation ${r.id < 0 ? '(new)' : r.id}</small></h4>
+    <div class="diff"><div class="${r.deleted ? 'del' : r.orig ? 'mod' : 'add'}">
+      way ${r.members.find((x) => x.role === 'from')?.ref} → way ${r.members.find((x) => x.role === 'to')?.ref}:
+      ${r.deleted ? '(deleted)' : `<code>connectivity</code> ${r.orig ? `<s>${esc(r.orig.tags.connectivity ?? '')}</s> → ` : ''}<b>${esc(r.tags.connectivity ?? '')}</b>`}
+    </div></div>`).join('');
   $('up-msg').textContent = '';
   $('up-msg').className = 'hint';
   dlgUpload.showModal();
 });
 
 $('up-osc').addEventListener('click', () => {
-  const blob = new Blob([buildOsmChange(modifiedWays(), -1)], { type: 'application/xml' });
+  const blob = new Blob([buildOsmChange(modifiedWays(), -1, modifiedRelations())], { type: 'application/xml' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `lanes-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.osc`;
@@ -417,7 +526,7 @@ $('up-go').addEventListener('click', async () => {
   go.disabled = true;
   try {
     const ways = modifiedWays();
-    const id = await uploader.upload(ways, data!, tags, (s) => (msg.textContent = s));
+    const id = await uploader.upload(ways, modifiedRelations(), data!, tags, (s) => (msg.textContent = s));
     const url = `${SERVERS[settings.server].webUrl}/changeset/${id}`;
     msg.innerHTML = `Uploaded! <a href="${url}" target="_blank" rel="noopener">Changeset ${id}</a>`;
     msg.className = 'hint';

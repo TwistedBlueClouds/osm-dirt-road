@@ -1,7 +1,7 @@
 {
   "name": "osm-lanes-3d",
   "version": "1.0.0",
-  "description": "3D visual editor for OpenStreetMap lane tagging: lanes, turn markings, lane changes and destinations",
+  "description": "3D visual editor for OpenStreetMap lane tagging: lanes, markings, junctions, lane connections and destinations",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
