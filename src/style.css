@@ -220,3 +220,8 @@ details.fields summary { cursor: pointer; font-size: 13px; text-transform: upper
 #legend .key span { display: inline-flex; align-items: center; gap: 5px; }
 #legend .key i { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
 #legend p { margin: 6px 0 0; color: var(--muted); }
+.lane-h { flex-wrap: wrap; gap: 4px; }
+.lane-h > span:first-child { white-space: nowrap; }
+.lane-h .tools { margin-left: auto; }
+.lane-h .tools button { padding: 1px 5px; }
+.lane { flex-basis: 268px; }
