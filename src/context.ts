@@ -2,7 +2,7 @@
 // Building walls and roofs come from the vendored osm-simple3d-editor geometry.
 
 import * as THREE from 'three';
-import type { Context, Tags } from './osm';
+import type { Context, Footprint, Tags } from './osm';
 import { buildTriangles, type LocalPolygon, type Pt } from './vendor/simple3d/building-geometry';
 import { computeHeights, parseLength } from './vendor/simple3d/heights';
 
@@ -48,10 +48,12 @@ function pushTris(src: number[], pos: number[], col: number[], c: THREE.Color, r
   }
 }
 
-export function buildBuildings(ctx: Context, project: Project): THREE.Mesh | null {
+/** `skip`: footprints drawn some other way (as model houses). */
+export function buildBuildings(ctx: Context, project: Project, skip?: Set<Footprint>): THREE.Mesh | null {
   const pos: number[] = [];
   const col: number[] = [];
   for (const b of ctx.buildings) {
+    if (skip?.has(b)) continue;
     const local = (ring: [number, number][]): Pt[] => {
       const pts = ring.map(([lon, lat]) => {
         const p = project(lat, lon);

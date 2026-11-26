@@ -281,7 +281,7 @@ export async function loadFromApi(server: ServerConfig, b: BBox): Promise<OsmDat
 export async function loadFromOverpass(b: BBox): Promise<OsmData> {
   const bb = `(${b.south},${b.west},${b.north},${b.east})`;
   const q = `[out:xml][timeout:90];(way["highway"]${bb};way["building"]${bb};way["building:part"]${bb};way["natural"="tree_row"]${bb};` +
-    `node["natural"="tree"]${bb};node["highway"="street_lamp"]${bb};relation["building"]${bb};relation["type"~"^(connectivity|restriction)$"]${bb};way["railway"]${bb};);(._;>>;);out meta;`;
+    `node["natural"="tree"]${bb};node["highway"="street_lamp"]${bb};node["amenity"="bench"]${bb};way["waterway"~"^(river|canal)$"]${bb};relation["building"]${bb};relation["type"~"^(connectivity|restriction)$"]${bb};way["railway"]${bb};);(._;>>;);out meta;`;
   const text = await fetchText('https://overpass-api.de/api/interpreter', {
     method: 'POST',
     body: new URLSearchParams({ data: q }),

@@ -21,6 +21,8 @@ over aerial imagery, edit them lane by lane, and upload the result as an OSM cha
 | `highway=crossing` (+ `crossing`, `crossing:markings`), `highway=traffic_signals`, `highway=stop` / `give_way`, `traffic_calming` on nodes | Zebra or line crossings, stop and give-way lines, signal heads, signs, speed humps |
 | `bridge`, `layer`, `tunnel` | Raised bridges with decks, parapets and piers, approach ramps that climb to them, faded tunnels |
 | `type=connectivity` relations, or `turn:lanes` and junction shape where none is mapped | Lane connections: arrows from a lane to the lanes it leads into, dashed guide lines for turns through junctions |
+| `railway=rail/light_rail/subway/tram/narrow_gauge` | Tracks (ballast, sleepers, rails; tram rails set into the street), raised on bridges and viaducts, with a train or tram on some stretches |
+| `waterway=river/canal`, `amenity=bench` | A few boats on the water; benches |
 | `surface` | Asphalt, concrete, paving, or a brown dirt/gravel road for unpaved surfaces |
 | `building`, `building:part`, `height`, `building:levels`, `roof:shape`, colours; `natural=tree` (with `leaf_type`, `height`), tree rows; `highway=street_lamp` | Surrounding buildings (Simple 3D Buildings), low-poly trees and street lamps, for orientation |
 | `parking:left/right/both` (+ `:orientation`) | Parked cars in the bays. A few vehicles also stand in the lanes for scale and direction; these are decoration, not data (toggle **Cars**) |
@@ -75,6 +77,9 @@ are not part of the draft yet.
 - Shadows are for depth and orientation; the sun's path is approximate, not computed for the
   date and place. Graphics options (shadows, building edges, antialiasing) are in ⚙ Settings.
 - Pitched roofs on complex outlines are drawn flat (see `src/vendor/simple3d/README.md`).
+- Plain detached houses (no height, roof or colour tags, roughly rectangular) are drawn as
+  model houses stretched to their outline. That is decoration, not their real shape; turn it
+  off in ⚙ Settings to see the mapped outlines. Cars, trains and boats are decoration too.
 - Islands, hatched areas and other painted areas mapped as polygons are not drawn.
 - Lane connections are only inferred where roads end at a junction node.
 
@@ -116,7 +121,8 @@ settings, and add the Pages URL + `land.html` as a redirect URI on your OAuth ap
 - `src/elevation.ts`: bridge and ramp heights
 - `src/speed.ts`: speed limit parsing and colours
 - `src/context.ts`: surrounding buildings and fallback trees
-- `src/models.ts`: low-poly models (cars, trees, street lamps) as instanced meshes
+- `src/models.ts`: low-poly models as instanced meshes
+- `src/scenery.ts`: railway tracks and trains, boats, benches, model houses
 - `src/mapview.ts`: the map, backgrounds, area selection, zoomed-out road overlay
 - `src/textures.ts`: canvas-drawn arrows, lettering, signs and signals
 - `src/editor.ts`: lane editor side panel
@@ -132,7 +138,7 @@ settings, and add the Pages URL + `land.html` as a redirect URI on your OAuth ap
 - [Lane Studio](https://github.com/MarcelMarzec/LaneStudio) by the Lane Studio contributors
   (ISC, a fork of iD): the lane-type rules follow its model, and its lane types, roadside,
   street features, junctions and connectivity tools were the model for the same features here.
-- Car, tree and street lamp models: [Kenney](https://kenney.nl) asset kits (CC0), see
+- Car, train, boat, house, tree, bench and street lamp models: [Kenney](https://kenney.nl) asset kits (CC0), see
   `public/models/kenney/README.md`.
 - Aerial imagery: Esri World Imagery. Map tiles and data © OpenStreetMap contributors.
 

@@ -14,6 +14,7 @@ import { isModified, type OsmData, type OsmWay } from './osm';
 import { connectionCurve, connectionsFrom, solveJunctions, type Arm, type Connection, type WayGeo } from './junctions';
 import { laneKind, layoutLanes, layoutSide, mayChange, parseRoad, type DrivingSide, type LaneSlot, type SideStrip } from './lanes';
 import { BROADLEAF, CARS, CONIFERS, LARGE_VEHICLES, ModelLibrary, hash2, type Placement } from './models';
+import { benchPlacements, boatPlacements, buildRails, housePlacements } from './scenery';
 import { speedColour } from './speed';
 import { arrowTexture, bikeTexture, roadTextTexture, signFaceTexture, signTexture, signalTexture, type SignStyle } from './textures';
 
@@ -22,6 +23,8 @@ export type ColourBy = 'surface' | 'speed' | 'tags';
 export interface SceneOptions {
   /** Decorative vehicles: parked cars in parking strips and a few in the lanes. */
   cars?: boolean;
+  /** Draw plain detached houses as model houses instead of extruded outlines. */
+  modelHouses?: boolean;
   /** What the lane colours show: the road surface, speed limits, or how completely lanes are tagged. */
   colourBy?: ColourBy;
   /** Sun shadows from buildings, trees, bridges and signs. */
@@ -346,10 +349,38 @@ export class LaneLayer implements CustomLayerInterface {
     this.edges = null;
     if (!this.data) return;
     const project = (lat: number, lon: number) => this.project(lat, lon);
-    const b = buildBuildings(this.data.context, project);
+    const road: { x: number; z: number }[] = [];
+    for (const g of this.geos.values()) for (const p of g.pts) road.push(p);
+    let houses: ReturnType<typeof housePlacements> | null = null;
+    if (this.models.ready) {
+      if (this.opts.modelHouses !== false) houses = housePlacements(this.data.context.buildings, project, this.models.native, road);
+      const rails = buildRails(this.data, project, this.models.native, (out, pts, l, r) => buildStructure(out, pts, l, r, true));
+      this.surroundings.add(this.models.build([
+        ...this.lampPlacements(), ...benchPlacements(this.data, project, road), ...boatPlacements(this.data, project),
+        ...rails.trains, ...(houses?.placements ?? []),
+      ]));
+      if (rails.pos.length) {
+        const rg = new THREE.BufferGeometry();
+        rg.setAttribute('position', new THREE.Float32BufferAttribute(rails.pos, 3));
+        rg.setAttribute('color', new THREE.Float32BufferAttribute(rails.col, 3));
+        rg.computeVertexNormals();
+        const rm = new THREE.Mesh(rg, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+        rm.receiveShadow = true;
+        rm.frustumCulled = false;
+        this.surroundings.add(rm);
+      }
+      if (rails.structure.length) {
+        const sg = new THREE.BufferGeometry();
+        sg.setAttribute('position', new THREE.Float32BufferAttribute(rails.structure, 3));
+        sg.computeVertexNormals();
+        const sm = new THREE.Mesh(sg, this.matStructure);
+        sm.castShadow = sm.receiveShadow = true;
+        sm.frustumCulled = false;
+        this.surroundings.add(sm);
+      }
+    }
+    const b = buildBuildings(this.data.context, project, houses?.replaced);
     const t = this.models.ready ? this.models.build(this.treePlacements()) : buildTrees(this.data.context, project);
-    const lamps = this.models.ready ? this.models.build(this.lampPlacements()) : null;
-    if (lamps) this.surroundings.add(lamps);
     if (b) {
       b.castShadow = b.receiveShadow = true;
       this.surroundings.add(b);
@@ -414,6 +445,12 @@ export class LaneLayer implements CustomLayerInterface {
       for (const b of this.built.values()) for (const c of b.cars) all.push(c);
       this.vehicles.add(this.models.build(all));
     }
+    this.repaint();
+  }
+
+  setModelHouses(on: boolean) {
+    this.opts.modelHouses = on;
+    this.rebuildSurroundings();
     this.repaint();
   }
 

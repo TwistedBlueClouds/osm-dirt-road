@@ -32,12 +32,13 @@ interface Settings {
   sunHour: number;
   colourBy: ColourBy;
   cars: boolean;
+  modelHouses: boolean;
 }
 const SETTINGS_KEY = 'osm-lanes-3d.settings';
 const DRAFT_KEY = 'osm-lanes-3d.draft';
 
 function loadSettings(): Settings {
-  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true, antialias: true, shadows: true, edges: true, sunHour: 15, colourBy: 'surface', cars: true };
+  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true, antialias: true, shadows: true, edges: true, sunHour: 15, colourBy: 'surface', cars: true, modelHouses: true };
   try {
     return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') };
   } catch {
@@ -617,6 +618,7 @@ function openSettings() {
   ($('set-aa') as HTMLInputElement).checked = settings.antialias;
   ($('set-shadows') as HTMLInputElement).checked = settings.shadows;
   ($('set-edges') as HTMLInputElement).checked = settings.edges;
+  ($('set-houses') as HTMLInputElement).checked = settings.modelHouses;
   $('set-redirect').textContent = redirectUri();
   dlgSettings.showModal();
 }
@@ -636,6 +638,7 @@ dlgSettings.addEventListener('close', () => {
     antialias: ($('set-aa') as HTMLInputElement).checked,
     shadows: ($('set-shadows') as HTMLInputElement).checked,
     edges: ($('set-edges') as HTMLInputElement).checked,
+    modelHouses: ($('set-houses') as HTMLInputElement).checked,
     server,
     drivingSide: ($('set-side') as HTMLSelectElement).value as DrivingSide,
     centreLine: ($('set-centre') as HTMLSelectElement).value as Settings['centreLine'],
@@ -647,6 +650,7 @@ dlgSettings.addEventListener('close', () => {
   scene.setOptions(settings);
   scene.setShadows(settings.shadows);
   scene.setBuildingEdges(settings.edges);
+  scene.setModelHouses(settings.modelHouses);
   if (aaChanged) status('Antialiasing changes when the page is reloaded.');
   if (serverChanged) {
     data = null;
