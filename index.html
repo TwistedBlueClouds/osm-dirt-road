@@ -38,6 +38,11 @@
           <option value="imagery">Aerial imagery</option>
           <option value="osm">OSM map</option>
         </select>
+        <select id="colour-by" title="What the lane colours show">
+          <option value="surface">Colour: normal</option>
+          <option value="speed">Colour: speed limits</option>
+          <option value="tags">Colour: lane tagging</option>
+        </select>
         <label class="slider" title="Road surface opacity: lower it to compare markings with the imagery">Surface
           <input id="opacity" type="range" min="0" max="1" step="0.05"></label>
         <label class="slider" title="Show buildings and trees"><input id="surroundings" type="checkbox"> Buildings</label>
@@ -45,6 +50,7 @@
           <input id="sun" type="range" min="5.5" max="20.5" step="0.25"></label>
         <span id="view-hint">Drag to pan · right-drag or Ctrl+drag to tilt/rotate · click a lane to edit</span>
       </div>
+      <div id="legend" hidden></div>
     </section>
     <aside id="editor" aria-label="Lane editor"></aside>
   </main>

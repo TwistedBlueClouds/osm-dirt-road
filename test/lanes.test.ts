@@ -165,3 +165,13 @@ test('roadside read and write', () => {
   assert.deepEqual(strips.map((s) => s.kind), ['cycle', 'parking', 'sidewalk']);
   assert.equal(strips[0].left, 3);
 });
+
+test('speed parsing and colours', async () => {
+  const { parseSpeed, speedColour, SPEED_MISSING } = await import('../src/speed.ts');
+  assert.equal(parseSpeed('50')?.kmh, 50);
+  assert.ok(Math.abs(parseSpeed('30 mph')!.kmh - 48.28) < 0.01);
+  assert.equal(parseSpeed('DE:urban'), undefined);
+  assert.equal(speedColour(undefined), SPEED_MISSING);
+  assert.equal(speedColour('30 mph'), speedColour('50'));
+  assert.notEqual(speedColour('30'), speedColour('50'));
+});

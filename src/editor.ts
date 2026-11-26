@@ -54,6 +54,12 @@ export class LaneEditor {
   onConnect: (ref: LaneRef) => void = () => {};
   /** Lane whose connections are being edited (button shown active). */
   connecting: LaneRef | null = null;
+  /** Called when the user picks up a lane's values to paint onto other lanes. */
+  onPaint: (ref: LaneRef) => void = () => {};
+  /** Lane being used as the brush (button shown active). */
+  painting: LaneRef | null = null;
+  /** Called to copy this road's lanes onto the road it continues into. */
+  onCopyAhead: (wayId: number) => void = () => {};
   server: ServerConfig | null = null;
 
   constructor(private root: HTMLElement) {
@@ -73,7 +79,7 @@ export class LaneEditor {
     let restore: string | null = null;
     if (active && this.root.contains(active)) {
       const card = active.closest<HTMLElement>('.lane');
-      const sel = active.dataset.k ? `[data-k="${active.dataset.k}"]` : active.dataset.act ? `[data-act="${active.dataset.act}"]${active.dataset.v ? `[data-v="${active.dataset.v}"]` : ''}` : null;
+      const sel = active.dataset.road ? `[data-road="${active.dataset.road}"]` : active.dataset.k ? `[data-k="${active.dataset.k}"]` : active.dataset.act ? `[data-act="${active.dataset.act}"]${active.dataset.v ? `[data-v="${active.dataset.v}"]` : ''}` : null;
       if (sel) restore = card ? `.lane[data-dir="${card.dataset.dir}"][data-i="${card.dataset.i}"] ${sel}` : sel;
     }
     const scroll = this.root.scrollTop;
@@ -140,7 +146,22 @@ export class LaneEditor {
               `<label class="check"><input type="checkbox" data-act="both" ${m.bothWays ? 'checked' : ''}> Centre turn lane</label>`}
         </div>
         ${m.implied ? '<p class="hint">No lane tags yet — editing will add them.</p>' : ''}
+        <div class="row"><button data-act="copy-ahead" title="Give the road this one continues into the same lanes, then move on to it">Copy lanes to next road →</button></div>
       </section>
+
+      <details class="fields" open>
+        <summary>Road</summary>
+        <div class="grid2">
+          <label>Name <input data-road="name" value="${h(w.tags.name ?? '')}"></label>
+          <label>Ref <input data-road="ref" value="${h(w.tags.ref ?? '')}"></label>
+          <label>Speed limit <input data-road="maxspeed" value="${h(w.tags.maxspeed ?? '')}" placeholder="e.g. 50 or 30 mph"></label>
+          <label>Surface <select data-road="surface">${this.options(w.tags.surface ?? '', ['', 'asphalt', 'concrete', 'paving_stones', 'sett', 'compacted', 'gravel', 'fine_gravel', 'unpaved', 'ground', 'dirt'])}</select></label>
+          <label>Lane markings <select data-road="lane_markings">${this.options(w.tags.lane_markings ?? '', ['', 'yes', 'no'])}</select></label>
+          ${isOneway ? '' : `<label>Centre line <select data-road="overtaking">${this.options(w.tags.overtaking ?? (w.tags['overtaking:forward'] === 'yes' && w.tags['overtaking:backward'] === 'no' ? 'forward' : w.tags['overtaking:backward'] === 'yes' && w.tags['overtaking:forward'] === 'no' ? 'backward' : ''), ['', 'yes', 'no', 'forward', 'backward'], { '': '— (automatic)', yes: 'dashed: overtaking allowed', no: 'double solid: no overtaking', forward: 'forward may overtake', backward: 'backward may overtake' })}</select></label>`}
+          <label>Structure <select data-road="@structure">${this.options(w.tags.bridge && w.tags.bridge !== 'no' ? 'bridge' : w.tags.tunnel && w.tags.tunnel !== 'no' ? 'tunnel' : '', ['', 'bridge', 'tunnel'], { '': 'on the ground' })}</select></label>
+          <label>Layer <input data-road="layer" inputmode="numeric" value="${h(w.tags.layer ?? '')}" placeholder="0"></label>
+        </div>
+      </details>
 
       ${dirSection('forward', m.forward, isOneway ? (m.oneway === '-1' ? 'Lanes (travel ← against way direction)' : 'Lanes (travel → with way direction)') : 'Forward → (with way direction)')}
       ${m.bothWays ? `<section class="dir"><h3>Centre two-way lane</h3><div class="lanes" data-dir="both_ways">${this.laneCard('both_ways', 0, m.bothWays)}</div></section>` : ''}
@@ -169,6 +190,11 @@ export class LaneEditor {
     `;
   }
 
+  private options(cur: string, values: string[], labels: Record<string, string> = {}): string {
+    const all = values.includes(cur) ? values : [...values, cur];
+    return all.map((v) => `<option value="${h(v)}" ${v === cur ? 'selected' : ''}>${h(labels[v] ?? (v || '—'))}</option>`).join('');
+  }
+
   private sideCard(side: Side, r: Roadside): string {
     const sel = (f: keyof Roadside, cur: string, opts: [string, string][]) => `
       <select data-side="${side}" data-f="${f}">${opts.map(([v, label]) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${label}</option>`).join('')}
@@ -193,6 +219,9 @@ export class LaneEditor {
           <span>Lane ${i + 1}</span>
           ${removable ? `<span class="tools">
             <button data-act="connect" class="${this.connecting && this.connecting.dir === dir && this.connecting.index === i ? 'on' : ''}" title="Connect: choose which lanes this lane leads into at the junction">⇢</button>
+            <button data-act="paint" class="${this.painting && this.painting.dir === dir && this.painting.index === i ? 'on' : ''}" title="Paint: copy this lane's type, arrows, change rule, speed and width onto lanes you click">🖌</button>
+            <button data-act="mv-left" title="Move this lane one place to the left">◂</button>
+            <button data-act="mv-right" title="Move this lane one place to the right">▸</button>
             <button data-act="ins-left" title="Insert a lane to the left">+◂</button>
             <button data-act="ins-right" title="Insert a lane to the right">▸+</button>
             <button data-act="del" title="Remove this lane">✕</button></span>` : ''}
@@ -249,6 +278,20 @@ export class LaneEditor {
         card?.classList.add('focused');
         this.onFocusLane(this.focus);
         return;
+      case 'paint':
+        if (dir && dir !== 'both_ways') this.onPaint({ dir, index: i });
+        return;
+      case 'copy-ahead':
+        this.onCopyAhead(this.way.id);
+        return;
+      case 'mv-left':
+      case 'mv-right': {
+        const j = act === 'mv-left' ? i - 1 : i + 1;
+        if (dir === 'both_ways' || j < 0 || j >= list.length) return;
+        [list[i], list[j]] = [list[j], list[i]];
+        this.focus = { dir: dir!, index: j };
+        break;
+      }
       case 'connect':
         if (dir && dir !== 'both_ways') this.onConnect({ dir, index: i });
         return;
@@ -304,6 +347,31 @@ export class LaneEditor {
   private onInput(e: Event) {
     const el = e.target as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
     if (el.matches('[data-act="both"]')) return; // handled by click
+    if (el.dataset.road && this.way) {
+      const key = el.dataset.road;
+      const v = el.value.trim();
+      const tags = { ...this.way.tags };
+      if (key === '@structure') {
+        delete tags.bridge;
+        delete tags.tunnel;
+        if (v) tags[v] = 'yes';
+        // A bridge or tunnel needs a layer to say what it crosses.
+        if (v && !tags.layer) tags.layer = v === 'bridge' ? '1' : '-1';
+        if (!v) delete tags.layer;
+      } else if (key === 'overtaking') {
+        delete tags.overtaking;
+        delete tags['overtaking:forward'];
+        delete tags['overtaking:backward'];
+        if (v === 'forward' || v === 'backward') {
+          tags['overtaking:forward'] = v === 'forward' ? 'yes' : 'no';
+          tags['overtaking:backward'] = v === 'backward' ? 'yes' : 'no';
+        } else if (v) tags.overtaking = v;
+      } else if (v) tags[key] = v;
+      else delete tags[key];
+      const id = this.way.id;
+      setTimeout(() => this.onChange(id, tags), 0);
+      return;
+    }
     if (el.dataset.side && this.way) {
       const left = parseRoadside(this.way.tags, 'left');
       const right = parseRoadside(this.way.tags, 'right');

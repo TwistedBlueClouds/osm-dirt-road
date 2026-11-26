@@ -202,3 +202,21 @@ fieldset.checks legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
 dialog fieldset.checks label { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
 dialog fieldset.checks input { width: auto; margin: 0; }
 @media (max-width: 1700px) { #view-hint { display: none; } }
+details.fields { margin-top: 14px; }
+details.fields summary { cursor: pointer; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 700; margin-bottom: 6px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; }
+.grid2 label { font-size: 12px; color: var(--muted); }
+.grid2 input, .grid2 select { color: var(--ink); width: 100%; margin-top: 2px; }
+.lane { flex-basis: 250px; }
+#legend {
+  position: absolute; left: 10px; bottom: 40px; z-index: 5; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; font-size: 12px; max-width: 420px; box-shadow: 0 2px 10px rgba(0,0,0,.2);
+}
+#legend h4 { margin: 0 0 6px; font-size: 12px; }
+#legend .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+#legend .chips button { padding: 2px 8px; border-width: 2px; color: #111; font-weight: 600; }
+#legend .chips button.on { outline: 3px solid var(--focus); }
+#legend .key { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+#legend .key span { display: inline-flex; align-items: center; gap: 5px; }
+#legend .key i { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
+#legend p { margin: 6px 0 0; color: var(--muted); }

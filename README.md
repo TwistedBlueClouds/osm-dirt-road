@@ -36,15 +36,26 @@ and the junction is filled with a surface with rounded corners.
 2. **Look around.** Drag to pan, right-drag (or Ctrl+drag) to tilt and rotate. Switch the
    background between aerial imagery and the OSM map, lower the **Surface** slider to compare
    the drawn markings with the imagery underneath, and hide buildings if they are in the way.
-3. **Select a road** by clicking a lane (or, zoomed out, the coloured road line).
+   The ☀ slider sets the time of day for the sun and its shadows. **Colour** switches the lane
+   colours between the road surface, speed limits, and how completely lanes are tagged.
+3. **Select a road** by clicking a lane (or, zoomed out, the coloured road line). Hovering a
+   lane previews it and shows where it leads.
 4. **Edit** in the side panel:
    - direction, lane counts, centre turn lane;
+   - road: name, ref, speed limit, surface, lane markings, centre line (overtaking), bridge /
+     tunnel and layer;
    - per lane: type, speed limit, turn arrows, destinations, destination refs, lane-change
      rules and width;
    - roadside: pavement, cycleway, parking and hard shoulder on each side;
    - lane connections: press **⇢** on a lane, then click each lane it leads into at the
      junction (click again to remove, Esc to finish). This writes a `type=connectivity`
      relation;
+   - lane tools on each lane: ◂ ▸ move it, +◂ ▸+ insert a lane beside it, ✕ remove it, and
+     🖌 paint its type, arrows, change rule, speed and width onto any lanes you click;
+   - **Copy lanes to next road →** gives the road this one continues into the same lanes and
+     moves on to it, for working along a street;
+   - speed limits: choose **Colour: speed limits**, pick a limit in the legend and click roads
+     to set it. Roads without a limit show red;
    - **All tags** is a raw `key=value` editor for anything else.
 
    Edits re-render immediately; Ctrl+Z undoes them. Warnings flag mismatched lane counts and
@@ -59,8 +70,9 @@ are not part of the draft yet.
 ### Limits worth knowing
 
 - The view draws what the tags say; it does not check them against the imagery.
-- Heights are estimated from `layer` (6 m per level), not surveyed. Edit `bridge`/`layer`
-  and reload the area to see new heights.
+- Heights are estimated from `layer` (6 m per level), not surveyed.
+- Shadows are for depth and orientation; the sun's path is approximate, not computed for the
+  date and place. Graphics options (shadows, building edges, antialiasing) are in ⚙ Settings.
 - Pitched roofs on complex outlines are drawn flat (see `src/vendor/simple3d/README.md`).
 - Islands, hatched areas and other painted areas mapped as polygons are not drawn.
 - Lane connections are only inferred where roads end at a junction node.
@@ -101,6 +113,7 @@ settings, and add the Pages URL + `land.html` as a redirect URI on your OAuth ap
 - `src/lanelayer.ts`: MapLibre custom layer (Three.js): lanes, markings, arrows, gantries, street features, picking
 - `src/junctions.ts`: junction cut-backs and surfaces, lane connections
 - `src/elevation.ts`: bridge and ramp heights
+- `src/speed.ts`: speed limit parsing and colours
 - `src/context.ts`: surrounding buildings and trees
 - `src/mapview.ts`: the map, backgrounds, area selection, zoomed-out road overlay
 - `src/textures.ts`: canvas-drawn arrows, lettering, signs and signals

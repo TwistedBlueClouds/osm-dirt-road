@@ -1,6 +1,8 @@
 import './style.css';
 import { MapView, type Basemap } from './mapview';
-import { LaneLayer } from './lanelayer';
+import { LaneLayer, type ColourBy } from './lanelayer';
+import { KMH_CHOICES, MPH_CHOICES, SPEED_MISSING, parseSpeed, speedColour } from './speed';
+import { parseRoad, setLaneKind, laneKind, writeRoad, type Lane } from './lanes';
 import { LaneEditor, type LaneRef } from './editor';
 import {
   API_MAX_AREA, SERVERS, bboxArea, buildOsmChange, diffTags, isModified, isRelationModified, loadFromApi, loadFromOverpass,
@@ -28,12 +30,13 @@ interface Settings {
   shadows: boolean;
   edges: boolean;
   sunHour: number;
+  colourBy: ColourBy;
 }
 const SETTINGS_KEY = 'osm-lanes-3d.settings';
 const DRAFT_KEY = 'osm-lanes-3d.draft';
 
 function loadSettings(): Settings {
-  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true, antialias: true, shadows: true, edges: true, sunHour: 15 };
+  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true, antialias: true, shadows: true, edges: true, sunHour: 15, colourBy: 'surface' };
   try {
     return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') };
   } catch {
@@ -63,6 +66,10 @@ const undoStack: UndoEntry[] = [];
 /** Lane whose connections are being edited by clicking target lanes. */
 let connectFrom: { wayId: number; lane: LaneRef } | null = null;
 let nextNewId = -1;
+/** Lane values being painted onto clicked lanes. */
+let paintFrom: { lane: Lane; kind: ReturnType<typeof laneKind> } | null = null;
+/** Speed limit armed in the speed tool (a `maxspeed` value), set on clicked roads. */
+let speedBrush: string | null = null;
 
 const status = (msg: string, error = false) => {
   const el = $('status');
@@ -78,6 +85,18 @@ view.ready.then(() => view.map.addLayer(scene));
 view.map.on('click', (e) => {
   if (e.originalEvent.shiftKey) return;
   const pick = scene.pick(e.point.x, e.point.y);
+  if (paintFrom) {
+    if (pick?.slot && pick.slot.dir !== 'both_ways') paintLane(pick.wayId, { dir: pick.slot.dir, index: pick.slot.index });
+    return;
+  }
+  if (speedBrush && settings.colourBy === 'speed') {
+    const w = pick ? data?.ways.get(pick.wayId) : null;
+    if (w) {
+      setTags(w.id, { ...w.tags, maxspeed: speedBrush });
+      status(`Set maxspeed=${speedBrush} on ${w.tags.name ?? 'way ' + w.id}.`);
+    }
+    return;
+  }
   if (connectFrom) {
     if (pick?.slot && pick.slot.dir !== 'both_ways') toggleConnection({ wayId: pick.wayId, dir: pick.slot.dir, index: pick.slot.index });
     else status('Click a lane on a road leaving the junction (Esc to finish).');
@@ -85,6 +104,23 @@ view.map.on('click', (e) => {
   }
   if (pick) selectWay(pick.wayId, pick.slot ? { dir: pick.slot.dir, index: pick.slot.index } : null, false);
 });
+// Hover preview: the lane under the pointer and where it leads.
+let hoverQueued: { x: number; y: number } | null = null;
+view.map.on('mousemove', (e) => {
+  const first = !hoverQueued;
+  hoverQueued = { x: e.point.x, y: e.point.y };
+  if (!first) return;
+  requestAnimationFrame(() => {
+    const q = hoverQueued!;
+    hoverQueued = null;
+    if (view.map.isMoving()) return;
+    const pick = scene.pick(q.x, q.y);
+    scene.setHover(pick?.wayId ?? null, pick?.slot ? { dir: pick.slot.dir, index: pick.slot.index } : null);
+    if (!connectFrom && !paintFrom && !speedBrush) view.map.getCanvas().style.cursor = pick ? 'pointer' : '';
+  });
+});
+view.map.on('mouseout', () => scene.setHover(null));
+
 view.onOverlayClick = (id) => {
   if (selectedId !== id) selectWay(id);
 };
@@ -95,6 +131,7 @@ editor.show(null);
 function selectWay(id: number | null, lane: LaneRef | null = null, fly = true) {
   if (connectFrom) setConnectMode(null);
   editor.connecting = null;
+  if (paintFrom) setPaint(null);
   selectedId = id;
   selectedLane = lane;
   view.select(id);
@@ -167,6 +204,120 @@ function modifiedRelations(): OsmRelation[] {
 }
 
 // ---------------------------------------------------------------------------
+// Paint tool, copy to next road
+
+const PAINT_KEYS = ['turn', 'change', 'width', 'maxspeed'] as const;
+
+function setPaint(from: typeof paintFrom, ref: LaneRef | null = null) {
+  paintFrom = from;
+  editor.painting = from ? ref : null;
+  view.map.getCanvas().style.cursor = from ? 'copy' : '';
+  document.body.classList.toggle('connecting', !!from);
+  if (from) status('Painting: click lanes to give them this lane’s type, arrows, change rule, speed and width. Esc to finish.');
+}
+
+function paintLane(wayId: number, ref: LaneRef) {
+  const w = data?.ways.get(wayId);
+  if (!w || !paintFrom) return;
+  const model = parseRoad(w.tags);
+  const lane = (ref.dir === 'backward' ? model.backward : model.forward)[ref.index];
+  if (!lane) return;
+  for (const k of PAINT_KEYS) lane[k] = paintFrom.lane[k];
+  setLaneKind(lane, paintFrom.kind);
+  setTags(wayId, writeRoad(w.tags, model));
+}
+
+editor.onPaint = (ref) => {
+  const w = selectedId != null ? data?.ways.get(selectedId) : null;
+  if (!w || ref.dir === 'both_ways') return;
+  const same = editor.painting && editor.painting.dir === ref.dir && editor.painting.index === ref.index;
+  if (same) setPaint(null);
+  else {
+    const model = parseRoad(w.tags);
+    const lane = (ref.dir === 'backward' ? model.backward : model.forward)[ref.index];
+    if (!lane) return;
+    if (connectFrom) setConnectMode(null);
+    setPaint({ lane: { ...lane }, kind: laneKind(lane, w.tags.highway) }, ref);
+  }
+  editor.show(w, selectedLane);
+};
+
+/** Give the road this one runs into the same lanes, then select it to carry on. */
+editor.onCopyAhead = (wayId) => {
+  const w = data?.ways.get(wayId);
+  if (!w || !data) return;
+  const through = scene.connectionsOf(wayId).filter((c) => c.move === 'through' && c.from.dir === 'forward' && c.to.wayId !== wayId);
+  const targetId = through[0]?.to.wayId;
+  const target = targetId != null ? data.ways.get(targetId) : null;
+  const geo = scene.getGeo(wayId);
+  const tGeo = targetId != null ? scene.getGeo(targetId) : null;
+  if (!target || !geo || !tGeo || !scene.endsAt(target.id, geo.endNode)) {
+    status('No single road continues straight on from the end of this one.', true);
+    return;
+  }
+  const src = parseRoad(w.tags);
+  const dst = parseRoad(target.tags);
+  if ((src.oneway === 'no') !== (dst.oneway === 'no')) {
+    status('The next road has a different direction setting (one-way vs two-way); lanes were not copied.', true);
+    return;
+  }
+  const copy = (lanes: Lane[]) => lanes.map((l) => ({ ...l }));
+  // Drawing directions line up when the next road starts where this one ends.
+  const sameSense = through[0].to.dir === 'forward';
+  if (src.oneway !== 'no') dst.forward = copy(src.forward);
+  else if (sameSense) {
+    dst.forward = copy(src.forward);
+    dst.backward = copy(src.backward);
+  } else {
+    dst.forward = copy(src.backward);
+    dst.backward = copy(src.forward);
+  }
+  dst.bothWays = src.bothWays ? { ...src.bothWays } : null;
+  setTags(target.id, writeRoad(target.tags, dst));
+  selectWay(target.id);
+  status(`Copied lanes to ${target.tags.name ?? 'way ' + target.id}.`);
+};
+
+// ---------------------------------------------------------------------------
+// Colour modes and the speed-limit tool
+
+const hex = (n: number) => '#' + n.toString(16).padStart(6, '0');
+
+function refreshLegend() {
+  const el = $('legend');
+  const mode = settings.colourBy;
+  el.hidden = mode === 'surface';
+  if (mode === 'tags') {
+    el.innerHTML = `<h4>Lane tagging</h4><div class="key">
+      <span><i style="background:#1e88e5"></i>per-lane tags</span><span><i style="background:#7e57c2"></i>lane count only</span>
+      <span><i style="background:#8a8a8a"></i>no lane tags</span><span><i style="background:#ff6d00"></i>edited</span></div>`;
+  } else if (mode === 'speed') {
+    const mph = !!data && Array.from(data.ways.values()).filter((w) => parseSpeed(w.tags.maxspeed)?.mph).length > data.ways.size / 10;
+    const choices = (mph ? MPH_CHOICES : KMH_CHOICES).map((n) => (mph ? `${n} mph` : String(n)));
+    const missing = data ? Array.from(data.ways.values()).filter((w) => !parseSpeed(w.tags.maxspeed)).length : 0;
+    el.innerHTML = `<h4>Speed limits <small>— pick one, then click roads to set it</small></h4>
+      <div class="chips">${choices.map((v) => `<button data-speed="${v}" class="${speedBrush === v ? 'on' : ''}" style="background:${hex(speedColour(v))};border-color:${hex(speedColour(v))}">${v}</button>`).join('')}</div>
+      <p><i style="background:${hex(SPEED_MISSING)};width:14px;height:10px;display:inline-block;border-radius:2px"></i> no speed limit tagged${missing ? `: ${missing} road${missing > 1 ? 's' : ''}` : ''}</p>`;
+  }
+}
+$('legend').addEventListener('click', (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLElement>('[data-speed]');
+  if (!b) return;
+  speedBrush = speedBrush === b.dataset.speed ? null : b.dataset.speed!;
+  view.map.getCanvas().style.cursor = speedBrush ? 'copy' : '';
+  if (speedBrush) status(`Click roads to set maxspeed=${speedBrush}. Click the chip again (or Esc) to stop.`);
+  refreshLegend();
+});
+($('colour-by') as HTMLSelectElement).value = settings.colourBy;
+$('colour-by').addEventListener('change', (e) => {
+  settings.colourBy = (e.target as HTMLSelectElement).value as ColourBy;
+  saveSettings(settings);
+  speedBrush = null;
+  scene.setOptions({ colourBy: settings.colourBy });
+  refreshLegend();
+});
+
+// ---------------------------------------------------------------------------
 // Lane connections (type=connectivity relations)
 
 function setConnectMode(from: { wayId: number; lane: LaneRef } | null) {
@@ -235,6 +386,7 @@ function refreshCounts() {
   $('n-changes').textContent = String(n);
   ($('btn-upload') as HTMLButtonElement).disabled = n === 0;
   ($('btn-undo') as HTMLButtonElement).disabled = undoStack.length === 0;
+  if (settings.colourBy !== 'surface') refreshLegend();
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +506,12 @@ document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !typing) {
     e.preventDefault();
     undo();
+  } else if (e.key === 'Escape' && (paintFrom || speedBrush)) {
+    setPaint(null);
+    speedBrush = null;
+    refreshLegend();
+    status('Done.');
+    if (selectedId != null) editor.show(data?.ways.get(selectedId) ?? null, selectedLane);
   } else if (e.key === 'Escape' && connectFrom) {
     setConnectMode(null);
     status('Finished connecting lanes.');
@@ -572,6 +730,7 @@ $('up-go').addEventListener('click', async () => {
 });
 
 refreshCounts();
+refreshLegend();
 refreshAccount();
 status('Pick an area: move the map and press Load, or draw a rectangle with “Draw area” / Shift+drag.');
 

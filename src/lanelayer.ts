@@ -10,12 +10,17 @@ import { MercatorCoordinate, type CustomLayerInterface, type CustomRenderMethodI
 import { buildBuildings, buildTrees } from './context';
 import { ROAD_GRADE, isBridge, isTunnel, solveHeights } from './elevation';
 import { line, pointAt, polyLength, slice, strip, vertexNormals, type V2 } from './geom';
-import type { OsmData, OsmWay } from './osm';
+import { isModified, type OsmData, type OsmWay } from './osm';
 import { connectionCurve, connectionsFrom, solveJunctions, type Arm, type Connection, type WayGeo } from './junctions';
 import { laneKind, layoutLanes, layoutSide, mayChange, parseRoad, type DrivingSide, type LaneSlot, type SideStrip } from './lanes';
+import { speedColour } from './speed';
 import { arrowTexture, bikeTexture, roadTextTexture, signFaceTexture, signTexture, signalTexture, type SignStyle } from './textures';
 
+export type ColourBy = 'surface' | 'speed' | 'tags';
+
 export interface SceneOptions {
+  /** What the lane colours show: the road surface, speed limits, or how completely lanes are tagged. */
+  colourBy?: ColourBy;
   /** Sun shadows from buildings, trees, bridges and signs. */
   shadows?: boolean;
   /** Dark outline along building edges. */
@@ -109,6 +114,8 @@ export class LaneLayer implements CustomLayerInterface {
   private triWay: Int32Array = new Int32Array(0);
   private triSlot: Int32Array = new Int32Array(0);
   private selected: { wayId: number; lane: LaneRef | null } | null = null;
+  private hovered: { wayId: number; lane: LaneRef | null } | null = null;
+  private hoverGroup = new THREE.Group();
   opts: SceneOptions;
 
   private matAsphalt = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.85 });
@@ -117,6 +124,8 @@ export class LaneLayer implements CustomLayerInterface {
   private matSel = new THREE.MeshBasicMaterial({ color: 0x29b6f6, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
   private matConn = new THREE.MeshBasicMaterial({ color: 0x4dd0e1, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 });
   private matConnSel = new THREE.MeshBasicMaterial({ color: 0xffb300, transparent: true, opacity: 0.95, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 });
+  private matHover = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+  private matHoverConn = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.75, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 });
   private matSelLane = new THREE.MeshBasicMaterial({ color: 0xff9800, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
   private hemi = new THREE.HemisphereLight(0xffffff, 0x6b7466, 1.25);
   private sun = new THREE.DirectionalLight(0xffffff, 1.6);
@@ -136,7 +145,7 @@ export class LaneLayer implements CustomLayerInterface {
   constructor(opts: SceneOptions) {
     this.opts = opts;
     this.matCentre.color.set(opts.centreLine === 'yellow' ? 0xf2c21b : 0xf2f2ee);
-    this.root.add(this.surroundings, this.roads, this.decor, this.highlight);
+    this.root.add(this.surroundings, this.roads, this.decor, this.highlight, this.hoverGroup);
     this.scene.add(this.root);
     this.scene.add(this.hemi, this.sun, this.sun.target);
     this.sun.shadow.mapSize.set(4096, 4096);
@@ -307,8 +316,8 @@ export class LaneLayer implements CustomLayerInterface {
     this.model = new THREE.Matrix4()
       .makeTranslation(this.originMc.x, this.originMc.y, 0)
       .multiply(new THREE.Matrix4().set(m, 0, 0, 0, 0, 0, m, 0, 0, m, 0, 0, 0, 0, 0, 1));
-    this.nodeH = solveHeights(data);
     this.selected = null;
+    this.hovered = null;
     this.rebuildAll();
     this.rebuildSurroundings();
   }
@@ -355,6 +364,7 @@ export class LaneLayer implements CustomLayerInterface {
     for (const b of this.built.values()) this.disposeGroup(b.decor);
     this.built.clear();
     this.geos.clear();
+    if (this.data) this.nodeH = solveHeights(this.data); // bridge / layer tags may have changed
     this.junctionTris = [];
     this.guides = [];
     if (!this.data) return;
@@ -454,9 +464,15 @@ export class LaneLayer implements CustomLayerInterface {
       }
     };
     // Surface, one strip per lane so picks resolve to a lane; reserved lanes are tinted.
+    const mode = this.opts.colourBy ?? 'surface';
+    const hasPerLane = Object.keys(w.tags).some((k) => k.includes(':lanes'));
+    const tagColour = new THREE.Color(isModified(w) ? 0xff6d00 : hasPerLane ? 0x1e88e5 : w.tags.lanes ? 0x7e57c2 : 0x8a8a8a);
     slots.forEach((s, i) => {
       const kind = laneKind(s.lane, w.tags.highway);
-      paint(strip(b.asphalt, pts, s.left, s.right, 0), KIND_COLOR[kind] ?? surface, i);
+      const c = mode === 'speed' ? new THREE.Color(speedColour(s.lane.maxspeed || w.tags.maxspeed))
+        : mode === 'tags' ? tagColour
+        : KIND_COLOR[kind] ?? surface;
+      paint(strip(b.asphalt, pts, s.left, s.right, 0), c, i);
     });
 
     const L = polyLength(pts);
@@ -871,6 +887,7 @@ export class LaneLayer implements CustomLayerInterface {
       this.roads.add(sm);
     }
     this.drawHighlight();
+    this.drawHover();
     this.repaint();
   }
 
@@ -878,6 +895,7 @@ export class LaneLayer implements CustomLayerInterface {
   select(wayId: number | null, lane: LaneRef | null = null) {
     this.selected = wayId == null ? null : { wayId, lane };
     this.drawHighlight();
+    this.drawHover();
   }
 
   private drawHighlight() {
@@ -906,16 +924,25 @@ export class LaneLayer implements CustomLayerInterface {
       this.highlight.add(hl);
     }
     // Where the selected lane (or every lane of the way) leads.
-    const ribbons: number[] = [];
-    const strong: number[] = [];
-    for (const c of this.connectionsOf(this.selected.wayId)) {
+    const ribbons = this.connectionTris(this.selected.wayId, s ? { dir: s.dir, index: s.index } : null);
+    if (ribbons.length) {
+      const cg = new THREE.BufferGeometry();
+      cg.setAttribute('position', new THREE.Float32BufferAttribute(ribbons, 3));
+      const cm = new THREE.Mesh(cg, s ? this.matConnSel : this.matConn);
+      cm.renderOrder = 4;
+      cm.frustumCulled = false;
+      this.highlight.add(cm);
+    }
+  }
+
+  /** Arrow ribbons for the connections out of a way, or of one of its lanes. */
+  private connectionTris(wayId: number, lane: LaneRef | null): number[] {
+    const out: number[] = [];
+    for (const c of this.connectionsOf(wayId)) {
+      if (lane && !(c.from.dir === lane.dir && c.from.index === lane.index)) continue;
       const curve = connectionCurve(c, this.geos);
       if (!curve) continue;
-      const mine = s && c.from.dir === s.dir && c.from.index === s.index;
-      if (s && !mine) continue;
-      const out = mine ? strong : ribbons;
       strip(out, curve, -0.22, 0.22, 0.04);
-      // Arrow head
       const a = curve[curve.length - 2];
       const e = curve[curve.length - 1];
       const dl = Math.hypot(e.x - a.x, e.z - a.z) || 1;
@@ -923,15 +950,44 @@ export class LaneLayer implements CustomLayerInterface {
       const y = (e.h ?? 0) + 0.04;
       out.push(e.x + dx * 1.4, y, e.z + dz * 1.4, e.x - dz * 0.7, y, e.z + dx * 0.7, e.x + dz * 0.7, y, e.z - dx * 0.7);
     }
-    for (const [arr, mat] of [[ribbons, this.matConn], [strong, this.matConnSel]] as const) {
-      if (!arr.length) continue;
-      const cg = new THREE.BufferGeometry();
-      cg.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
-      const cm = new THREE.Mesh(cg, mat);
-      cm.renderOrder = 4;
-      cm.frustumCulled = false;
-      this.highlight.add(cm);
-    }
+    return out;
+  }
+
+  /** Preview under the pointer: the lane and where it leads. Returns true when it changed. */
+  setHover(wayId: number | null, lane: LaneRef | null = null): boolean {
+    const h = this.hovered;
+    if ((h?.wayId ?? null) === wayId && (h?.lane?.dir ?? null) === (lane?.dir ?? null) && (h?.lane?.index ?? null) === (lane?.index ?? null)) return false;
+    this.hovered = wayId == null ? null : { wayId, lane };
+    this.drawHover();
+    return true;
+  }
+
+  private drawHover() {
+    this.hoverGroup.children.forEach((c) => (c as THREE.Mesh).geometry.dispose());
+    this.hoverGroup.clear();
+    this.repaint();
+    const h = this.hovered;
+    if (!h) return;
+    const sel = this.selected;
+    // Nothing to add when hovering exactly what is already selected.
+    if (sel && sel.wayId === h.wayId && sel.lane?.dir === h.lane?.dir && sel.lane?.index === h.lane?.index) return;
+    const b = this.built.get(h.wayId);
+    if (!b || !b.slots.length) return;
+    const slot = h.lane && b.slots.find((x) => x.dir === h.lane!.dir && x.index === h.lane!.index);
+    const tris: number[] = [];
+    if (slot) strip(tris, b.pts, slot.left, slot.right, 0.014);
+    else strip(tris, b.pts, b.slots[0].left, b.slots[b.slots.length - 1].right, 0.014);
+    const add = (arr: number[], mat: THREE.Material, order: number) => {
+      if (!arr.length) return;
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
+      const m = new THREE.Mesh(g, mat);
+      m.renderOrder = order;
+      m.frustumCulled = false;
+      this.hoverGroup.add(m);
+    };
+    add(tris, this.matHover, 1);
+    if (slot && slot.dir !== 'both_ways') add(this.connectionTris(h.wayId, { dir: slot.dir, index: slot.index }), this.matHoverConn, 4);
   }
 
   /** Where to point the camera to look along a way in its travel direction. */
