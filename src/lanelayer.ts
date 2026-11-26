@@ -8,7 +8,8 @@
 import * as THREE from 'three';
 import { MercatorCoordinate, type CustomLayerInterface, type CustomRenderMethodInput, type Map as MlMap } from 'maplibre-gl';
 import { buildBuildings, buildTrees } from './context';
-import { line, pointAt, polyLength, strip, type V2 } from './geom';
+import { ROAD_GRADE, isBridge, isTunnel, solveHeights } from './elevation';
+import { line, pointAt, polyLength, strip, vertexNormals, type V2 } from './geom';
 import type { OsmData, OsmWay } from './osm';
 import { layoutLanes, mayChange, parseRoad, type DrivingSide, type LaneSlot } from './lanes';
 import { arrowTexture, signTexture, type SignStyle } from './textures';
@@ -55,6 +56,10 @@ interface Built {
   triSlot: number[];
   white: number[];
   centre: number[];
+  /** Bridge decks, parapets, piers and ramp walls. */
+  structure: number[];
+  /** 1 = normal, lower for tunnels. */
+  alpha: number;
   decor: THREE.Group;
 }
 
@@ -75,6 +80,7 @@ export class LaneLayer implements CustomLayerInterface {
   private data: OsmData | null = null;
   private built = new Map<number, Built>();
   private degree = new Map<number, number>();
+  private nodeH = new Map<number, number>();
   private roads = new THREE.Group();
   private decor = new THREE.Group();
   private highlight = new THREE.Group();
@@ -90,6 +96,7 @@ export class LaneLayer implements CustomLayerInterface {
   private matCentre = new THREE.MeshBasicMaterial({ color: 0xf2c21b, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   private matSel = new THREE.MeshBasicMaterial({ color: 0x29b6f6, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
   private matSelLane = new THREE.MeshBasicMaterial({ color: 0xff9800, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+  private matStructure = new THREE.MeshLambertMaterial({ color: 0xb9b6ae, side: THREE.DoubleSide });
   private matSteel = new THREE.MeshLambertMaterial({ color: 0x9aa0a6 });
   private matSignBack = new THREE.MeshLambertMaterial({ color: 0x6b7075 });
 
@@ -186,6 +193,7 @@ export class LaneLayer implements CustomLayerInterface {
         this.degree.set(n, (this.degree.get(n) ?? 0) + inc);
       });
     }
+    this.nodeH = solveHeights(data);
     this.selected = null;
     this.rebuildAll();
     this.rebuildSurroundings();
@@ -242,10 +250,12 @@ export class LaneLayer implements CustomLayerInterface {
   private buildWay(w: OsmWay): Built {
     const d = this.data!;
     const model = parseRoad(w.tags);
-    let pts = w.nodes.map((id) => {
+    let pts: V2[] = w.nodes.map((id) => {
       const n = d.nodes.get(id)!;
-      return this.project(n.lat, n.lon);
+      return { ...this.project(n.lat, n.lon), h: this.nodeH.get(id) ?? 0 };
     });
+    const raised = pts.some((p) => (p.h ?? 0) > 0.05);
+    if (raised) pts = densifyRamp(pts);
     let endNodes = [w.nodes[0], w.nodes[w.nodes.length - 1]];
     if (model.oneway === '-1') {
       pts = pts.slice().reverse();
@@ -255,7 +265,7 @@ export class LaneLayer implements CustomLayerInterface {
     const slots = layoutLanes(w.tags, model, this.opts.drivingSide);
     const b: Built = {
       way: w, pts, slots, asphalt: [], asphaltColor: surfaceColor(w.tags), triSlot: [],
-      white: [], centre: [], decor: new THREE.Group(),
+      white: [], centre: [], structure: [], alpha: isTunnel(w.tags) ? 0.45 : 1, decor: new THREE.Group(),
     };
     if (pts.length < 2) return b;
 
@@ -327,6 +337,7 @@ export class LaneLayer implements CustomLayerInterface {
       }
     }
 
+    if (raised && slots.length) buildStructure(b.structure, pts, slots[0].left - 0.35, slots[slots.length - 1].right + 0.35, isBridge(w.tags));
     this.buildArrows(b, L, trim);
     this.buildSigns(b, L);
     return b;
@@ -358,7 +369,7 @@ export class LaneLayer implements CustomLayerInterface {
         mesh.renderOrder = 3;
         const g = new THREE.Group();
         g.add(mesh);
-        g.position.set(p.x + nx * off, 0.03, p.z + nz * off);
+        g.position.set(p.x + nx * off, (p.h ?? 0) + 0.03, p.z + nz * off);
         g.rotation.y = Math.atan2(-dir.x, -dir.z);
         b.decor.add(g);
       }
@@ -391,7 +402,7 @@ export class LaneLayer implements CustomLayerInterface {
       const span0 = ordered[0].l - 0.6;
       const span1 = ordered[ordered.length - 1].r + 0.6;
       const H = 7.4;
-      const at3 = (off: number, y: number) => new THREE.Vector3(p.x + nx * off, y, p.z + nz * off);
+      const at3 = (off: number, y: number) => new THREE.Vector3(p.x + nx * off, (p.h ?? 0) + y, p.z + nz * off);
 
       const beam = new THREE.Mesh(new THREE.BoxGeometry(span1 - span0, 0.35, 0.35), this.matSteel);
       beam.position.copy(at3((span0 + span1) / 2, H));
@@ -428,11 +439,12 @@ export class LaneLayer implements CustomLayerInterface {
     let triCount = 0;
     for (const b of this.built.values()) triCount += b.asphalt.length / 9;
     const pos = new Float32Array(triCount * 9);
-    const col = new Float32Array(triCount * 9);
+    const col = new Float32Array(triCount * 12);
     this.triWay = new Int32Array(triCount);
     this.triSlot = new Int32Array(triCount);
     const white: number[] = [];
     const centre: number[] = [];
+    const structure: number[] = [];
     let t = 0;
     for (const b of this.built.values()) {
       pos.set(b.asphalt, t * 9);
@@ -441,19 +453,22 @@ export class LaneLayer implements CustomLayerInterface {
         this.triWay[t + i] = b.way.id;
         this.triSlot[t + i] = b.triSlot[i] ?? -1;
         for (let v = 0; v < 3; v++) {
-          col[(t + i) * 9 + v * 3] = b.asphaltColor.r;
-          col[(t + i) * 9 + v * 3 + 1] = b.asphaltColor.g;
-          col[(t + i) * 9 + v * 3 + 2] = b.asphaltColor.b;
+          const o = (t + i) * 12 + v * 4;
+          col[o] = b.asphaltColor.r;
+          col[o + 1] = b.asphaltColor.g;
+          col[o + 2] = b.asphaltColor.b;
+          col[o + 3] = b.alpha;
         }
       }
       t += n;
       for (const v of b.white) white.push(v);
       for (const v of b.centre) centre.push(v);
+      for (const v of b.structure) structure.push(v);
       this.decor.add(b.decor);
     }
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    g.setAttribute('color', new THREE.BufferAttribute(col, 4));
     this.asphaltMesh?.geometry.dispose();
     this.asphaltMesh = new THREE.Mesh(g, this.matAsphalt);
     this.asphaltMesh.frustumCulled = false;
@@ -465,6 +480,14 @@ export class LaneLayer implements CustomLayerInterface {
       lm.renderOrder = 2;
       lm.frustumCulled = false;
       this.roads.add(lm);
+    }
+    if (structure.length) {
+      const sg = new THREE.BufferGeometry();
+      sg.setAttribute('position', new THREE.Float32BufferAttribute(structure, 3));
+      sg.computeVertexNormals();
+      const sm = new THREE.Mesh(sg, this.matStructure);
+      sm.frustumCulled = false;
+      this.roads.add(sm);
     }
     this.drawHighlight();
     this.repaint();
@@ -510,5 +533,80 @@ export class LaneLayer implements CustomLayerInterface {
     const L = polyLength(b.pts);
     const { p, dir } = pointAt(b.pts, L * 0.5);
     return { center: this.unproject(p), bearing: (Math.atan2(dir.x, -dir.z) * 180) / Math.PI, length: L };
+  }
+}
+
+/** Add points along a raised way so ramps follow the maximum grade instead of one long slope. */
+function densifyRamp(p: V2[]): V2[] {
+  const out: V2[] = [p[0]];
+  for (let i = 1; i < p.length; i++) {
+    const a = p[i - 1];
+    const b = p[i];
+    const ha = a.h ?? 0;
+    const hb = b.h ?? 0;
+    const len = Math.hypot(b.x - a.x, b.z - a.z);
+    const n = ha > 0.05 || hb > 0.05 ? Math.floor(len / 8) : 0;
+    for (let k = 1; k < n; k++) {
+      const t = k / n;
+      // Each end's height falls away at the ramp grade; never below the straight line between them.
+      const h = Math.max(ha - ROAD_GRADE * len * t, hb - ROAD_GRADE * len * (1 - t), Math.min(ha, hb), 0);
+      out.push({ x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t, h });
+    }
+    out.push(b);
+  }
+  return out;
+}
+
+/** Vertical wall along a polyline at a lateral offset, between two height functions. */
+function wall(out: number[], p: V2[], n: V2[], off: number, top: (h: number) => number, bottom: (h: number) => number) {
+  for (let i = 0; i < p.length - 1; i++) {
+    const h0 = p[i].h ?? 0;
+    const h1 = p[i + 1].h ?? 0;
+    if (h0 < 0.05 && h1 < 0.05) continue;
+    const x0 = p[i].x + n[i].x * off, z0 = p[i].z + n[i].z * off;
+    const x1 = p[i + 1].x + n[i + 1].x * off, z1 = p[i + 1].z + n[i + 1].z * off;
+    const t0 = top(h0), t1 = top(h1), b0 = bottom(h0), b1 = bottom(h1);
+    out.push(x0, b0, z0, x1, b1, z1, x0, t0, z0, x0, t0, z0, x1, b1, z1, x1, t1, z1);
+  }
+}
+
+const DECK_M = 1.0;
+const PARAPET_M = 0.9;
+
+/** Bridge: deck slab, parapets and piers. Ramp (raised, not a bridge): retaining walls to the ground. */
+function buildStructure(out: number[], p: V2[], left: number, right: number, bridge: boolean) {
+  const n = vertexNormals(p);
+  const under = (h: number) => (bridge ? Math.max(h - DECK_M, 0) : 0);
+  for (const off of [left, right]) {
+    wall(out, p, n, off, (h) => h + PARAPET_M, under);
+    // Inner face of the parapet, so it reads as a wall from the road too.
+    wall(out, p, n, off + (off < 0 ? 0.25 : -0.25), (h) => h + PARAPET_M, (h) => h);
+  }
+  if (!bridge) return;
+  // Underside of the deck.
+  for (let i = 0; i < p.length - 1; i++) {
+    const h0 = p[i].h ?? 0, h1 = p[i + 1].h ?? 0;
+    if (h0 < DECK_M && h1 < DECK_M) continue;
+    const q = (k: number, off: number, h: number) => [p[k].x + n[k].x * off, under(h), p[k].z + n[k].z * off];
+    out.push(...q(i, left, h0), ...q(i + 1, left, h1), ...q(i, right, h0), ...q(i, right, h0), ...q(i + 1, left, h1), ...q(i + 1, right, h1));
+  }
+  // Piers roughly every 28 m where there is room beneath.
+  const L = polyLength(p);
+  const count = Math.floor(L / 28);
+  for (let k = 1; k <= count; k++) {
+    const { p: c, dir } = pointAt(p, (L * k) / (count + 1));
+    const top = (c.h ?? 0) - DECK_M;
+    if (top < 2) continue;
+    const w = Math.min(Math.max((right - left) * 0.35, 1.2), 6) / 2;
+    const t = 0.6;
+    const rx = -dir.z, rz = dir.x;
+    const mid = (left + right) / 2;
+    const corner = (a: number, bb: number) => [c.x + rx * (mid + a) + dir.x * bb, c.z + rz * (mid + a) + dir.z * bb];
+    const cs = [corner(-w, -t), corner(w, -t), corner(w, t), corner(-w, t)];
+    for (let i = 0; i < 4; i++) {
+      const [ax, az] = cs[i];
+      const [bx, bz] = cs[(i + 1) % 4];
+      out.push(ax, 0, az, bx, 0, bz, ax, top, az, ax, top, az, bx, 0, bz, bx, top, bz);
+    }
   }
 }
