@@ -11,8 +11,8 @@ const TURN_GLYPH: Record<string, string> = {
   sharp_right: '↘', reverse: '↶', merge_to_left: '⇠', merge_to_right: '⇢', none: '∅',
 };
 
-export type { LaneRef } from './scene3d';
-import type { LaneRef } from './scene3d';
+export type { LaneRef } from './lanelayer';
+import type { LaneRef } from './lanelayer';
 
 function h(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);

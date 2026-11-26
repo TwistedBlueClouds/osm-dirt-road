@@ -1,8 +1,13 @@
-// Three.js scene: renders every loaded road with lanes, markings, turn arrows
-// and destination gantries, and lets the user pick a way / lane.
+// MapLibre custom layer (Three.js): renders every loaded road with lanes, markings,
+// turn arrows and destination gantries on the map, and resolves clicks to a way / lane.
+//
+// The Three-in-MapLibre wiring (shared GL context, local metric frame placed with a
+// model matrix folded into the projection) follows the approach used by
+// osm-simple3d-editor (ISC, © Aleksandr Petrov): https://github.com/FelisPimeja/osm-simple3d-editor
 
 import * as THREE from 'three';
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { MercatorCoordinate, type CustomLayerInterface, type CustomRenderMethodInput, type Map as MlMap } from 'maplibre-gl';
+import { line, pointAt, polyLength, strip, type V2 } from './geom';
 import type { OsmData, OsmWay } from './osm';
 import { layoutLanes, mayChange, parseRoad, type DrivingSide, type LaneSlot } from './lanes';
 import { arrowTexture, signTexture, type SignStyle } from './textures';
@@ -21,125 +26,6 @@ export interface LaneRef {
 export interface PickResult {
   wayId: number;
   slot: LaneSlot | null;
-}
-
-type V2 = { x: number; z: number };
-
-// ---------------------------------------------------------------------------
-// Polyline helpers (x/z plane, metres)
-
-function segLen(a: V2, b: V2): number {
-  return Math.hypot(b.x - a.x, b.z - a.z);
-}
-
-function polyLength(p: V2[]): number {
-  let s = 0;
-  for (let i = 1; i < p.length; i++) s += segLen(p[i - 1], p[i]);
-  return s;
-}
-
-/** Right-hand normal at each vertex, miter-scaled (clamped) so offsets stay parallel. */
-function vertexNormals(p: V2[]): V2[] {
-  const n = p.length;
-  const segN: V2[] = [];
-  for (let i = 0; i < n - 1; i++) {
-    const dx = p[i + 1].x - p[i].x;
-    const dz = p[i + 1].z - p[i].z;
-    const l = Math.hypot(dx, dz) || 1;
-    segN.push({ x: -dz / l, z: dx / l });
-  }
-  const out: V2[] = [];
-  for (let i = 0; i < n; i++) {
-    const a = segN[Math.max(0, i - 1)];
-    const b = segN[Math.min(n - 2, i)];
-    let x = a.x + b.x;
-    let z = a.z + b.z;
-    const l = Math.hypot(x, z);
-    if (l < 1e-6) {
-      out.push(b);
-      continue;
-    }
-    x /= l;
-    z /= l;
-    const cos = x * b.x + z * b.z;
-    const scale = Math.min(1 / Math.max(cos, 1e-3), 3);
-    out.push({ x: x * scale, z: z * scale });
-  }
-  return out;
-}
-
-/** Sub-polyline between arc-lengths s0..s1. */
-function slice(p: V2[], s0: number, s1: number): V2[] {
-  const out: V2[] = [];
-  let acc = 0;
-  for (let i = 1; i < p.length; i++) {
-    const a = p[i - 1];
-    const b = p[i];
-    const l = segLen(a, b);
-    const e = acc + l;
-    if (e >= s0 && acc <= s1 && l > 0) {
-      const t0 = Math.max(0, (s0 - acc) / l);
-      const t1 = Math.min(1, (s1 - acc) / l);
-      const pa = { x: a.x + (b.x - a.x) * t0, z: a.z + (b.z - a.z) * t0 };
-      const pb = { x: a.x + (b.x - a.x) * t1, z: a.z + (b.z - a.z) * t1 };
-      if (!out.length) out.push(pa);
-      out.push(pb);
-    }
-    acc = e;
-    if (acc > s1) break;
-  }
-  return out;
-}
-
-function pointAt(p: V2[], s: number): { p: V2; dir: V2 } {
-  let acc = 0;
-  for (let i = 1; i < p.length; i++) {
-    const a = p[i - 1];
-    const b = p[i];
-    const l = segLen(a, b);
-    if (acc + l >= s || i === p.length - 1) {
-      const t = l > 0 ? Math.min(1, Math.max(0, (s - acc) / l)) : 0;
-      return {
-        p: { x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t },
-        dir: { x: (b.x - a.x) / (l || 1), z: (b.z - a.z) / (l || 1) },
-      };
-    }
-    acc += l;
-  }
-  return { p: p[0], dir: { x: 0, z: -1 } };
-}
-
-/** Push a flat ribbon between lateral offsets a..b (triangles, xyz). */
-function strip(out: number[], p: V2[], a: number, b: number, y: number): number {
-  if (p.length < 2) return 0;
-  const n = vertexNormals(p);
-  let tris = 0;
-  for (let i = 0; i < p.length - 1; i++) {
-    const a0x = p[i].x + n[i].x * a, a0z = p[i].z + n[i].z * a;
-    const b0x = p[i].x + n[i].x * b, b0z = p[i].z + n[i].z * b;
-    const a1x = p[i + 1].x + n[i + 1].x * a, a1z = p[i + 1].z + n[i + 1].z * a;
-    const b1x = p[i + 1].x + n[i + 1].x * b, b1z = p[i + 1].z + n[i + 1].z * b;
-    out.push(a0x, y, a0z, a1x, y, a1z, b0x, y, b0z);
-    out.push(b0x, y, b0z, a1x, y, a1z, b1x, y, b1z);
-    tris += 2;
-  }
-  return tris;
-}
-
-function line(out: number[], p: V2[], offset: number, width: number, y: number, dash?: [number, number], trim = [0, 0]) {
-  const L = polyLength(p);
-  const s0 = trim[0];
-  const s1 = L - trim[1];
-  if (s1 - s0 < 0.5) return;
-  if (!dash) {
-    strip(out, slice(p, s0, s1), offset - width / 2, offset + width / 2, y);
-    return;
-  }
-  const [on, off] = dash;
-  for (let s = s0; s < s1; s += on + off) {
-    const sub = slice(p, s, Math.min(s + on, s1));
-    strip(out, sub, offset - width / 2, offset + width / 2, y);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,13 +57,21 @@ interface Built {
   decor: THREE.Group;
 }
 
-export class LaneScene {
-  readonly renderer: THREE.WebGLRenderer;
-  readonly scene = new THREE.Scene();
-  readonly camera: THREE.PerspectiveCamera;
-  readonly controls: OrbitControls;
+export class LaneLayer implements CustomLayerInterface {
+  readonly id = 'lanes-3d';
+  readonly type = 'custom' as const;
+  readonly renderingMode = '3d' as const;
+  private map: MlMap | null = null;
+  private renderer: THREE.WebGLRenderer | null = null;
+  private readonly scene = new THREE.Scene();
+  private readonly camera = new THREE.Camera();
+  /** Everything lives under `root` in local metres: x east, y up, z south. */
+  private readonly root = new THREE.Group();
+  private model = new THREE.Matrix4();
+  private lastProj = new THREE.Matrix4();
+  private originMc = new MercatorCoordinate(0, 0, 0);
+  private metre = 1;
   private data: OsmData | null = null;
-  private origin = { lat: 0, lon: 0 };
   private built = new Map<number, Built>();
   private degree = new Map<number, number>();
   private roads = new THREE.Group();
@@ -187,11 +81,9 @@ export class LaneScene {
   private triWay: Int32Array = new Int32Array(0);
   private triSlot: Int32Array = new Int32Array(0);
   private selected: { wayId: number; lane: LaneRef | null } | null = null;
-  private anim: { t0: number; from: [THREE.Vector3, THREE.Vector3]; to: [THREE.Vector3, THREE.Vector3] } | null = null;
-  private needsRender = true;
   opts: SceneOptions;
 
-  private matAsphalt = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  private matAsphalt = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.85 });
   private matWhite = new THREE.MeshBasicMaterial({ color: 0xf2f2ee, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   private matCentre = new THREE.MeshBasicMaterial({ color: 0xf2c21b, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   private matSel = new THREE.MeshBasicMaterial({ color: 0x29b6f6, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
@@ -199,98 +91,66 @@ export class LaneScene {
   private matSteel = new THREE.MeshLambertMaterial({ color: 0x9aa0a6 });
   private matSignBack = new THREE.MeshLambertMaterial({ color: 0x6b7075 });
 
-  constructor(private container: HTMLElement, opts: SceneOptions, private onPick: (r: PickResult | null) => void) {
+  constructor(opts: SceneOptions) {
     this.opts = opts;
     this.matCentre.color.set(opts.centreLine === 'yellow' ? 0xf2c21b : 0xf2f2ee);
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    container.appendChild(this.renderer.domElement);
-
-    this.scene.background = new THREE.Color(0xbcd4e6);
-    this.scene.fog = new THREE.Fog(0xbcd4e6, 600, 2200);
-    this.camera = new THREE.PerspectiveCamera(55, 1, 0.5, 5000);
-    this.camera.position.set(0, 300, 300);
-
-    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-    this.controls.enableDamping = true;
-    this.controls.maxPolarAngle = Math.PI * 0.49;
-    this.controls.screenSpacePanning = false;
-    this.controls.addEventListener('change', () => (this.needsRender = true));
-
+    this.root.add(this.roads, this.decor, this.highlight);
+    this.scene.add(this.root);
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x556655, 1.6));
     const sun = new THREE.DirectionalLight(0xffffff, 1.4);
     sun.position.set(200, 400, 120);
     this.scene.add(sun);
-
-    const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(20000, 20000),
-      // Drawn first and never written to depth, so roads can't z-fight with it.
-      new THREE.MeshLambertMaterial({ color: 0x9fb08a, depthWrite: false }),
-    );
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.y = -0.08;
-    ground.renderOrder = -1;
-    this.scene.add(ground);
-    this.scene.add(this.roads, this.decor, this.highlight);
-
-    this.installPicking();
-    new ResizeObserver(() => this.resize()).observe(container);
-    this.resize();
-    const loop = () => {
-      requestAnimationFrame(loop);
-      this.tick();
-    };
-    loop();
   }
 
-  private resize() {
-    const w = this.container.clientWidth || 1;
-    const h = this.container.clientHeight || 1;
-    this.renderer.setSize(w, h);
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
-    this.needsRender = true;
+  onAdd(map: MlMap, gl: WebGL2RenderingContext | WebGLRenderingContext) {
+    this.map = map;
+    this.renderer = new THREE.WebGLRenderer({ canvas: map.getCanvas(), context: gl as WebGL2RenderingContext, antialias: true });
+    this.renderer.autoClear = false;
   }
 
-  private tick() {
-    if (this.anim) {
-      const t = Math.min(1, (performance.now() - this.anim.t0) / 700);
-      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-      this.camera.position.lerpVectors(this.anim.from[0], this.anim.to[0], e);
-      this.controls.target.lerpVectors(this.anim.from[1], this.anim.to[1], e);
-      if (t >= 1) this.anim = null;
-      this.needsRender = true;
-    }
-    if (this.controls.update()) this.needsRender = true;
-    if (this.needsRender) {
-      this.renderer.render(this.scene, this.camera);
-      this.needsRender = false;
-    }
+  onRemove() {
+    this.renderer?.dispose();
+    this.renderer = null;
   }
 
-  private installPicking() {
-    const el = this.renderer.domElement;
-    let down: { x: number; y: number } | null = null;
-    el.addEventListener('pointerdown', (e) => (down = { x: e.clientX, y: e.clientY }));
-    el.addEventListener('pointerup', (e) => {
-      if (!down || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) return;
-      down = null;
-      const r = el.getBoundingClientRect();
-      const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
-      const ray = new THREE.Raycaster();
-      ray.setFromCamera(ndc, this.camera);
-      if (!this.asphaltMesh) return;
-      const hit = ray.intersectObject(this.asphaltMesh, false)[0];
-      if (!hit || hit.faceIndex == null) {
-        this.onPick(null);
-        return;
-      }
-      const wayId = this.triWay[hit.faceIndex];
-      const b = this.built.get(wayId);
-      const si = this.triSlot[hit.faceIndex];
-      this.onPick({ wayId, slot: b && si >= 0 ? b.slots[si] : null });
-    });
+  render(_gl: unknown, options: CustomRenderMethodInput) {
+    if (!this.renderer || !this.data) return;
+    const main = new THREE.Matrix4().fromArray(options.defaultProjectionData.mainMatrix as unknown as number[]);
+    this.lastProj = main.multiply(this.model);
+    this.camera.projectionMatrix.copy(this.lastProj);
+    this.camera.projectionMatrixInverse.copy(this.lastProj).invert();
+    this.renderer.resetState();
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  private repaint() {
+    this.map?.triggerRepaint();
+  }
+
+  /** Resolve a screen point (CSS pixels in the map container) to a way / lane. */
+  pick(x: number, y: number): PickResult | null {
+    if (!this.asphaltMesh || !this.map) return null;
+    const c = this.map.getContainer();
+    const nx = (x / c.clientWidth) * 2 - 1;
+    const ny = -(y / c.clientHeight) * 2 + 1;
+    const inv = this.lastProj.clone().invert();
+    const near = new THREE.Vector3(nx, ny, -1).applyMatrix4(inv);
+    const far = new THREE.Vector3(nx, ny, 1).applyMatrix4(inv);
+    const ray = new THREE.Raycaster(near, far.sub(near).normalize());
+    this.scene.updateMatrixWorld();
+    const hit = ray.intersectObject(this.asphaltMesh, false)[0];
+    if (!hit || hit.faceIndex == null) return null;
+    const wayId = this.triWay[hit.faceIndex];
+    const b = this.built.get(wayId);
+    const si = this.triSlot[hit.faceIndex];
+    return { wayId, slot: b && si >= 0 ? b.slots[si] : null };
+  }
+
+  /** 0 = only markings over the imagery, 1 = solid road surface. */
+  setRoadOpacity(v: number) {
+    this.matAsphalt.opacity = v;
+    this.matAsphalt.visible = v > 0.01;
+    this.repaint();
   }
 
   setOptions(o: Partial<SceneOptions>) {
@@ -299,18 +159,24 @@ export class LaneScene {
     if (this.data) this.rebuildAll();
   }
 
-  project(lat: number, lon: number): V2 {
-    const R = 6378137;
-    const k = Math.cos((this.origin.lat * Math.PI) / 180);
-    return {
-      x: ((lon - this.origin.lon) * Math.PI / 180) * R * k,
-      z: -((lat - this.origin.lat) * Math.PI / 180) * R,
-    };
+  private project(lat: number, lon: number): V2 {
+    const c = MercatorCoordinate.fromLngLat({ lng: lon, lat }, 0);
+    return { x: (c.x - this.originMc.x) / this.metre, z: (c.y - this.originMc.y) / this.metre };
+  }
+
+  private unproject(p: V2): { lng: number; lat: number } {
+    return new MercatorCoordinate(this.originMc.x + p.x * this.metre, this.originMc.y + p.z * this.metre, 0).toLngLat();
   }
 
   setData(data: OsmData, centre: { lat: number; lon: number }) {
     this.data = data;
-    this.origin = centre;
+    this.originMc = MercatorCoordinate.fromLngLat({ lng: centre.lon, lat: centre.lat }, 0);
+    this.metre = this.originMc.meterInMercatorCoordinateUnits();
+    const m = this.metre;
+    // local (x east, y up, z south) → mercator (x east, y south, z up)
+    this.model = new THREE.Matrix4()
+      .makeTranslation(this.originMc.x, this.originMc.y, 0)
+      .multiply(new THREE.Matrix4().set(m, 0, 0, 0, 0, 0, m, 0, 0, m, 0, 0, 0, 0, 0, 1));
     this.degree.clear();
     for (const w of data.ways.values()) {
       w.nodes.forEach((n, i) => {
@@ -320,7 +186,11 @@ export class LaneScene {
     }
     this.selected = null;
     this.rebuildAll();
-    this.overview();
+  }
+
+  clear() {
+    this.data = null;
+    this.repaint();
   }
 
   private rebuildAll() {
@@ -464,6 +334,7 @@ export class LaneScene {
         const nx = -dir.z, nz = dir.x;
         const mesh = new THREE.Mesh(new THREE.PlaneGeometry(Math.min(lw * 0.55, 1.8), 5), mat);
         mesh.rotation.x = -Math.PI / 2;
+        mesh.renderOrder = 3;
         const g = new THREE.Group();
         g.add(mesh);
         g.position.set(p.x + nx * off, 0.03, p.z + nz * off);
@@ -562,17 +433,20 @@ export class LaneScene {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setAttribute('color', new THREE.BufferAttribute(col, 3));
-    g.computeVertexNormals();
     this.asphaltMesh?.geometry.dispose();
     this.asphaltMesh = new THREE.Mesh(g, this.matAsphalt);
+    this.asphaltMesh.frustumCulled = false;
     this.roads.add(this.asphaltMesh);
     for (const [arr, mat] of [[white, this.matWhite], [centre, this.matCentre]] as const) {
       const lg = new THREE.BufferGeometry();
       lg.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
-      this.roads.add(new THREE.Mesh(lg, mat));
+      const lm = new THREE.Mesh(lg, mat);
+      lm.renderOrder = 2;
+      lm.frustumCulled = false;
+      this.roads.add(lm);
     }
     this.drawHighlight();
-    this.needsRender = true;
+    this.repaint();
   }
 
   /** Highlight a way and optionally one of its lanes (by OSM direction + index). */
@@ -584,7 +458,7 @@ export class LaneScene {
   private drawHighlight() {
     this.highlight.children.forEach((c) => (c as THREE.Mesh).geometry.dispose());
     this.highlight.clear();
-    this.needsRender = true;
+    this.repaint();
     if (!this.selected) return;
     const b = this.built.get(this.selected.wayId);
     if (!b || !b.slots.length) return;
@@ -592,7 +466,9 @@ export class LaneScene {
     strip(all, b.pts, b.slots[0].left - 0.4, b.slots[b.slots.length - 1].right + 0.4, 0.01);
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(all, 3));
-    this.highlight.add(new THREE.Mesh(g, this.matSel));
+    const hm = new THREE.Mesh(g, this.matSel);
+    hm.renderOrder = 1;
+    this.highlight.add(hm);
     const ref = this.selected.lane;
     const s = ref && b.slots.find((x) => x.dir === ref.dir && x.index === ref.index);
     if (s) {
@@ -600,34 +476,18 @@ export class LaneScene {
       strip(one, b.pts, s.left, s.right, 0.012);
       const lg = new THREE.BufferGeometry();
       lg.setAttribute('position', new THREE.Float32BufferAttribute(one, 3));
-      this.highlight.add(new THREE.Mesh(lg, this.matSelLane));
+      const hl = new THREE.Mesh(lg, this.matSelLane);
+      hl.renderOrder = 1;
+      this.highlight.add(hl);
     }
   }
 
-  /** Fly the camera to a way, looking along its travel direction. */
-  focus(wayId: number) {
+  /** Where to point the camera to look along a way in its travel direction. */
+  wayFrame(wayId: number): { center: { lng: number; lat: number }; bearing: number; length: number } | null {
     const b = this.built.get(wayId);
-    if (!b || b.pts.length < 2) return;
+    if (!b || b.pts.length < 2) return null;
     const L = polyLength(b.pts);
     const { p, dir } = pointAt(b.pts, L * 0.5);
-    const back = Math.min(Math.max(L * 0.45, 30), 120);
-    const target = new THREE.Vector3(p.x + dir.x * back * 0.3, 0, p.z + dir.z * back * 0.3);
-    const cam = new THREE.Vector3(p.x - dir.x * back, back * 0.45 + 8, p.z - dir.z * back);
-    this.anim = {
-      t0: performance.now(),
-      from: [this.camera.position.clone(), this.controls.target.clone()],
-      to: [cam, target],
-    };
-  }
-
-  overview() {
-    let r = 200;
-    for (const b of this.built.values()) for (const p of b.pts) r = Math.max(r, Math.hypot(p.x, p.z));
-    r = Math.min(r, 1500);
-    this.anim = {
-      t0: performance.now(),
-      from: [this.camera.position.clone(), this.controls.target.clone()],
-      to: [new THREE.Vector3(0, r * 0.8, r * 0.7), new THREE.Vector3(0, 0, 0)],
-    };
+    return { center: this.unproject(p), bearing: (Math.atan2(dir.x, -dir.z) * 180) / Math.PI, length: L };
   }
 }

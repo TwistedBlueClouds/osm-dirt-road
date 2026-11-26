@@ -1,6 +1,6 @@
 import './style.css';
-import { AreaMap } from './map2d';
-import { LaneScene } from './scene3d';
+import { MapView, type Basemap } from './mapview';
+import { LaneLayer } from './lanelayer';
 import { LaneEditor, type LaneRef } from './editor';
 import {
   API_MAX_AREA, SERVERS, bboxArea, buildOsmChange, diffTags, isModified, loadFromApi, loadFromOverpass,
@@ -20,12 +20,14 @@ interface Settings {
   drivingSide: DrivingSide;
   centreLine: 'yellow' | 'white';
   signStyle: SignStyle;
+  basemap: Basemap;
+  roadOpacity: number;
 }
 const SETTINGS_KEY = 'osm-lanes-3d.settings';
 const DRAFT_KEY = 'osm-lanes-3d.draft';
 
 function loadSettings(): Settings {
-  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue' };
+  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85 };
   try {
     return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') };
   } catch {
@@ -57,11 +59,18 @@ const status = (msg: string, error = false) => {
   el.classList.toggle('error', error);
 };
 
-const map = new AreaMap($('map'));
-const scene = new LaneScene($('view3d'), settings, (pick) => {
-  if (!pick) return;
-  selectWay(pick.wayId, pick.slot ? { dir: pick.slot.dir, index: pick.slot.index } : null, false);
+const view = new MapView($('map'), settings.basemap);
+const scene = new LaneLayer(settings);
+scene.setRoadOpacity(settings.roadOpacity);
+view.ready.then(() => view.map.addLayer(scene));
+view.map.on('click', (e) => {
+  if (e.originalEvent.shiftKey) return;
+  const pick = scene.pick(e.point.x, e.point.y);
+  if (pick) selectWay(pick.wayId, pick.slot ? { dir: pick.slot.dir, index: pick.slot.index } : null, false);
 });
+view.onOverlayClick = (id) => {
+  if (selectedId !== id) selectWay(id);
+};
 const editor = new LaneEditor($('editor'));
 editor.server = SERVERS[settings.server];
 editor.show(null);
@@ -69,11 +78,12 @@ editor.show(null);
 function selectWay(id: number | null, lane: LaneRef | null = null, fly = true) {
   selectedId = id;
   selectedLane = lane;
-  map.select(id, !fly);
+  view.select(id);
   const way = id != null ? data?.ways.get(id) ?? null : null;
   editor.show(way, lane);
   scene.select(id, lane);
-  if (id != null && fly) scene.focus(id);
+  const frame = id != null && fly ? scene.wayFrame(id) : null;
+  if (frame) view.focus(frame);
 }
 
 editor.onFocusLane = (ref) => {
@@ -90,7 +100,7 @@ function setTags(id: number, tags: Tags, pushUndo = true) {
   if (pushUndo) undoStack.push({ wayId: id, tags: { ...w.tags } });
   w.tags = tags;
   scene.updateWay(id);
-  map.restyle(id);
+  view.restyle(id);
   if (selectedId === id) editor.show(w, selectedLane);
   refreshCounts();
   saveDraft();
@@ -156,8 +166,7 @@ function restoreDraft(d: OsmData): number {
 // ---------------------------------------------------------------------------
 // Loading
 
-map.onSelect = (id) => selectWay(id);
-map.onAreaChange = (b) => {
+view.onAreaChange = (b) => {
   if (b) status(`Area selected: ${describe(b)}. Press Load.`);
 };
 
@@ -168,7 +177,7 @@ function describe(b: BBox): string {
 }
 
 async function load() {
-  const area = map.getArea() ?? map.getView();
+  const area = view.getArea() ?? view.getView();
   const source = ($('source') as HTMLSelectElement).value;
   if (modifiedWays().length && !confirm('You have edits that are not uploaded. Loading a new area discards them (a draft is kept in this browser). Continue?')) return;
   if (source === 'api' && bboxArea(area) > API_MAX_AREA) {
@@ -187,8 +196,9 @@ async function load() {
     const restored = restoreDraft(d);
     data = d;
     undoStack.length = 0;
-    map.setLoaded(area, d);
     scene.setData(d, { lat: (area.north + area.south) / 2, lon: (area.east + area.west) / 2 });
+    view.setLoaded(area, d);
+    if (view.map.getZoom() < 16) view.fitLoaded();
     selectWay(null);
     refreshCounts();
     const withLanes = Array.from(d.ways.values()).filter((w) => Object.keys(w.tags).some((k) => k.includes(':lanes'))).length;
@@ -202,10 +212,22 @@ async function load() {
 
 $('btn-load').addEventListener('click', load);
 $('btn-draw').addEventListener('click', () => {
-  map.setDrawing(true);
+  view.setDrawing(true);
   status('Drag on the map to draw the area to load (Esc to cancel). Tip: Shift+drag works any time.');
 });
-$('btn-overview').addEventListener('click', () => scene.overview());
+$('btn-overview').addEventListener('click', () => view.fitLoaded());
+($('opacity') as HTMLInputElement).value = String(settings.roadOpacity);
+$('opacity').addEventListener('input', (e) => {
+  settings.roadOpacity = Number((e.target as HTMLInputElement).value);
+  saveSettings(settings);
+  scene.setRoadOpacity(settings.roadOpacity);
+});
+($('basemap') as HTMLSelectElement).value = settings.basemap;
+$('basemap').addEventListener('change', (e) => {
+  settings.basemap = (e.target as HTMLSelectElement).value as Basemap;
+  saveSettings(settings);
+  view.setBasemap(settings.basemap);
+});
 $('btn-undo').addEventListener('click', undo);
 
 document.addEventListener('keydown', (e) => {
@@ -243,7 +265,7 @@ $('search').addEventListener('submit', async (e) => {
       b.onclick = () => {
         results.hidden = true;
         const [s, n, w, ea] = r.boundingbox.map(Number);
-        map.map.fitBounds([[s, w], [n, ea]], { maxZoom: 17 });
+        view.map.fitBounds([[w, s], [ea, n]], { maxZoom: 17, duration: 0 });
       };
       results.appendChild(b);
     }
@@ -319,6 +341,7 @@ dlgSettings.addEventListener('close', () => {
   const serverChanged = server !== settings.server;
   if (serverChanged && modifiedWays().length && !confirm('Switching server discards loaded data and unsent edits. Continue?')) return;
   settings = {
+    ...settings,
     server,
     drivingSide: ($('set-side') as HTMLSelectElement).value as DrivingSide,
     centreLine: ($('set-centre') as HTMLSelectElement).value as Settings['centreLine'],
@@ -330,6 +353,8 @@ dlgSettings.addEventListener('close', () => {
   scene.setOptions(settings);
   if (serverChanged) {
     data = null;
+    scene.clear();
+    view.setLoaded(null, null);
     selectWay(null);
     status(`Server set to ${SERVERS[server].apiUrl}. Load an area to start.`);
   } else if (selectedId != null) {
@@ -390,7 +415,7 @@ $('up-go').addEventListener('click', async () => {
     msg.className = 'hint';
     for (const w of ways) {
       scene.updateWay(w.id);
-      map.restyle(w.id);
+      view.restyle(w.id);
     }
     undoStack.length = 0;
     refreshCounts();
@@ -411,9 +436,9 @@ $('up-go').addEventListener('click', async () => {
 
 refreshCounts();
 refreshAccount();
-status('Pick an area: zoom the map and press Load, or draw a rectangle with “Draw area” / Shift+drag.');
+status('Pick an area: move the map and press Load, or draw a rectangle with “Draw area” / Shift+drag.');
 
 // Dev-only handle for automated browser checks.
 if (import.meta.env.DEV) {
-  (window as unknown as Record<string, unknown>).__lanes = { selectWay, getData: () => data };
+  (window as unknown as Record<string, unknown>).__lanes = { selectWay, getData: () => data, view, scene };
 }

@@ -79,20 +79,19 @@ code { font-size: 12px; }
 
 #layout {
   display: grid;
-  grid-template-columns: minmax(260px, 28%) 1fr minmax(320px, 400px);
+  grid-template-columns: 1fr minmax(320px, 400px);
   min-height: 0;
 }
-#map { min-height: 0; border-right: 1px solid var(--line); }
-#map.drawing, #map.drawing .leaflet-interactive { cursor: crosshair !important; }
-#view3d { position: relative; min-height: 0; overflow: hidden; }
-#view3d canvas { display: block; }
+#map { position: relative; min-height: 0; overflow: hidden; }
 .overlay-tools {
-  position: absolute; top: 8px; left: 8px; display: flex; gap: 8px; align-items: center;
+  position: absolute; top: 10px; left: 52px; z-index: 5; display: flex; gap: 8px; align-items: center;
   pointer-events: none;
 }
 .overlay-tools > * { pointer-events: auto; }
+.slider { display: flex; align-items: center; gap: 6px; font-size: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; }
+.slider input { width: 90px; padding: 0; border: 0; background: none; }
 #view-hint {
-  font-size: 12px; background: rgba(0,0,0,.45); color: #fff; padding: 3px 8px; border-radius: 4px;
+  font-size: 12px; background: rgba(0,0,0,.5); color: #fff; padding: 3px 8px; border-radius: 4px;
 }
 #editor {
   background: var(--panel);
@@ -109,9 +108,9 @@ code { font-size: 12px; }
 #status.error { color: #c62828; }
 
 @media (max-width: 1000px) {
-  #layout { grid-template-columns: 1fr; grid-template-rows: 35vh 50vh auto; }
-  #map { border-right: 0; border-bottom: 1px solid var(--line); }
-  #editor { border-left: 0; }
+  #layout { grid-template-columns: 1fr; grid-template-rows: 60vh auto; }
+  #editor { border-left: 0; border-top: 1px solid var(--line); }
+  #view-hint { display: none; }
   body { height: auto; }
 }
 
