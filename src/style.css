@@ -197,3 +197,8 @@ dialog label > input, dialog label > select, dialog label > textarea { display: 
 .lane.side label.check input { width: auto; margin: 0; }
 .lane-h .tools button.on { background: var(--focus); color: #000; border-color: var(--focus); }
 body.connecting #status { color: var(--accent); font-weight: 600; }
+fieldset.checks { border: 1px solid var(--line); border-radius: 6px; margin: 10px 0; padding: 6px 10px; }
+fieldset.checks legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
+dialog fieldset.checks label { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+dialog fieldset.checks input { width: auto; margin: 0; }
+@media (max-width: 1700px) { #view-hint { display: none; } }

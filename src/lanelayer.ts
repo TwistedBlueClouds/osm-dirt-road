@@ -16,6 +16,12 @@ import { laneKind, layoutLanes, layoutSide, mayChange, parseRoad, type DrivingSi
 import { arrowTexture, bikeTexture, roadTextTexture, signFaceTexture, signTexture, signalTexture, type SignStyle } from './textures';
 
 export interface SceneOptions {
+  /** Sun shadows from buildings, trees, bridges and signs. */
+  shadows?: boolean;
+  /** Dark outline along building edges. */
+  edges?: boolean;
+  /** Time of day for the sun, in hours. */
+  sunHour?: number;
   drivingSide: DrivingSide;
   centreLine: 'yellow' | 'white';
   signStyle: SignStyle;
@@ -112,6 +118,15 @@ export class LaneLayer implements CustomLayerInterface {
   private matConn = new THREE.MeshBasicMaterial({ color: 0x4dd0e1, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 });
   private matConnSel = new THREE.MeshBasicMaterial({ color: 0xffb300, transparent: true, opacity: 0.95, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 });
   private matSelLane = new THREE.MeshBasicMaterial({ color: 0xff9800, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+  private hemi = new THREE.HemisphereLight(0xffffff, 0x6b7466, 1.25);
+  private sun = new THREE.DirectionalLight(0xffffff, 1.6);
+  private sunDir = new THREE.Vector3(0.4, 0.8, 0.4);
+  private southern = false;
+  private shadowGround = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), shadowOnly(0.45, -1));
+  /** Copy of the road surface that only shows shadows, drawn over lanes and markings. */
+  private roadShadow: THREE.Mesh | null = null;
+  private matRoadShadow = shadowOnly(0.4, -5);
+  private edges: THREE.LineSegments | null = null;
   private matStructure = new THREE.MeshLambertMaterial({ color: 0xb9b6ae, side: THREE.DoubleSide });
   private matPole = new THREE.MeshLambertMaterial({ color: 0x23262a });
   private decalMats = new Map<THREE.Texture, THREE.MeshBasicMaterial>();
@@ -123,16 +138,90 @@ export class LaneLayer implements CustomLayerInterface {
     this.matCentre.color.set(opts.centreLine === 'yellow' ? 0xf2c21b : 0xf2f2ee);
     this.root.add(this.surroundings, this.roads, this.decor, this.highlight);
     this.scene.add(this.root);
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x556655, 1.6));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.4);
-    sun.position.set(200, 400, 120);
-    this.scene.add(sun);
+    this.scene.add(this.hemi, this.sun, this.sun.target);
+    this.sun.shadow.mapSize.set(4096, 4096);
+    this.sun.shadow.bias = -0.0006;
+    this.sun.shadow.normalBias = 0.6;
+    // Catches shadows on the map itself (the imagery has no mesh of its own).
+    this.shadowGround.rotation.x = -Math.PI / 2;
+    this.shadowGround.renderOrder = -1;
+    this.shadowGround.receiveShadow = true;
+    this.shadowGround.frustumCulled = false;
+    this.root.add(this.shadowGround);
+    this.setSun(opts.sunHour ?? 15);
+    this.setShadows(opts.shadows ?? true);
+  }
+
+  /**
+   * Time of day, 5–21 h. The sun rises in the east, passes south (north in the southern
+   * hemisphere) and sets in the west; this is for looks, not an ephemeris.
+   */
+  setSun(hour: number) {
+    this.opts.sunHour = hour;
+    const t = Math.min(Math.max((hour - 5) / 16, 0.02), 0.98); // 0 sunrise … 1 sunset
+    const elevation = Math.sin(t * Math.PI) * (62 * Math.PI / 180);
+    const south = this.southern ? -1 : 1;
+    const az = Math.PI * t; // 0 = east, π/2 = south/north, π = west
+    const horiz = Math.cos(elevation);
+    this.sunDir.set(Math.cos(az) * horiz, Math.sin(elevation), Math.sin(az) * horiz * south).normalize();
+    const low = 1 - Math.sin(t * Math.PI); // 1 at the horizon
+    this.sun.color.setHSL(0.09, 0.9 * low * low, 1 - 0.25 * low * low);
+    this.sun.intensity = 1.9 - 0.9 * low;
+    this.hemi.intensity = 1.25 - 0.35 * low;
+    this.repaint();
+  }
+
+  setShadows(on: boolean) {
+    this.opts.shadows = on;
+    this.sun.castShadow = on;
+    this.shadowGround.visible = on;
+    if (this.roadShadow) this.roadShadow.visible = on;
+    if (this.renderer) this.renderer.shadowMap.enabled = on;
+    this.scene.traverse((o) => {
+      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+      for (const x of Array.isArray(m) ? m : m ? [m] : []) x.needsUpdate = true;
+    });
+    this.repaint();
+  }
+
+  setBuildingEdges(on: boolean) {
+    this.opts.edges = on;
+    if (this.edges) this.edges.visible = on;
+    this.repaint();
+  }
+
+  /** Keep the shadow map centred on what the map shows, sized to the visible ground. */
+  private aimSun() {
+    const map = this.map!;
+    const c = map.getCenter();
+    const p = this.project(c.lat, c.lng);
+    const canvas = map.getCanvas();
+    const mpp = (78271.5 * Math.cos((c.lat * Math.PI) / 180)) / 2 ** map.getZoom();
+    const r = Math.min(Math.max(mpp * Math.max(canvas.clientWidth, canvas.clientHeight) * (1 + map.getPitch() / 60), 150), 1600);
+    // Snap to shadow-map texels so shadows don't shimmer while panning.
+    const texel = (2 * r) / this.sun.shadow.mapSize.x;
+    const cx = Math.round(p.x / texel) * texel;
+    const cz = Math.round(p.z / texel) * texel;
+    this.sun.target.position.set(cx, 0, cz);
+    // Keep the depth range tight around the scene: it sets the shadow map's precision.
+    const dist = r * 2 + 400;
+    this.sun.position.set(cx, 0, cz).addScaledVector(this.sunDir, dist);
+    const cam = this.sun.shadow.camera;
+    if (cam.right !== r) {
+      cam.left = -r; cam.right = r; cam.top = r; cam.bottom = -r;
+      cam.near = 10; cam.far = dist + r * 1.5;
+      cam.updateProjectionMatrix();
+    }
+    this.shadowGround.position.set(cx, 0.005, cz);
+    this.shadowGround.scale.setScalar(r * 2.2);
   }
 
   onAdd(map: MlMap, gl: WebGL2RenderingContext | WebGLRenderingContext) {
     this.map = map;
     this.renderer = new THREE.WebGLRenderer({ canvas: map.getCanvas(), context: gl as WebGL2RenderingContext, antialias: true });
     this.renderer.autoClear = false;
+    this.renderer.shadowMap.enabled = !!this.opts.shadows;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   }
 
   onRemove() {
@@ -146,8 +235,19 @@ export class LaneLayer implements CustomLayerInterface {
     this.lastProj = main.multiply(this.model);
     this.camera.projectionMatrix.copy(this.lastProj);
     this.camera.projectionMatrixInverse.copy(this.lastProj).invert();
+    // Three restores this viewport after drawing the shadow map; keep it equal to the map's.
+    const canvas = this.map!.getCanvas();
     this.renderer.resetState();
+    this.renderer.setViewport(0, 0, canvas.width, canvas.height);
+    if (this.opts.shadows) this.aimSun();
+    // MapLibre narrows the depth range for its 3D pass. A shadow map written under that
+    // range no longer matches the depths the shaders compare against, so use the full
+    // range while Three draws and hand MapLibre's back afterwards.
+    const gl = this.renderer.getContext();
+    const range = gl.getParameter(gl.DEPTH_RANGE) as Float32Array;
+    gl.depthRange(0, 1);
     this.renderer.render(this.scene, this.camera);
+    gl.depthRange(range[0], range[1]);
   }
 
   private repaint() {
@@ -198,6 +298,8 @@ export class LaneLayer implements CustomLayerInterface {
 
   setData(data: OsmData, centre: { lat: number; lon: number }) {
     this.data = data;
+    this.southern = centre.lat < 0;
+    this.setSun(this.opts.sunHour ?? 15);
     this.originMc = MercatorCoordinate.fromLngLat({ lng: centre.lon, lat: centre.lat }, 0);
     this.metre = this.originMc.meterInMercatorCoordinateUnits();
     const m = this.metre;
@@ -213,15 +315,30 @@ export class LaneLayer implements CustomLayerInterface {
 
   private rebuildSurroundings() {
     this.surroundings.traverse((o) => {
-      if (o instanceof THREE.Mesh) o.geometry.dispose();
+      if (o instanceof THREE.Mesh || o instanceof THREE.LineSegments) o.geometry.dispose();
     });
     this.surroundings.clear();
+    this.edges = null;
     if (!this.data) return;
     const project = (lat: number, lon: number) => this.project(lat, lon);
     const b = buildBuildings(this.data.context, project);
     const t = buildTrees(this.data.context, project);
-    if (b) this.surroundings.add(b);
-    if (t) this.surroundings.add(t);
+    if (b) {
+      b.castShadow = b.receiveShadow = true;
+      this.surroundings.add(b);
+      // Dark lines along wall and roof edges, the crisp look of a 3D building editor.
+      this.edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(b.geometry, 28),
+        new THREE.LineBasicMaterial({ color: 0x2f2f2f, transparent: true, opacity: 0.5 }),
+      );
+      this.edges.frustumCulled = false;
+      this.edges.visible = this.opts.edges ?? true;
+      this.surroundings.add(this.edges);
+    }
+    if (t) {
+      t.traverse((o) => (o.castShadow = true));
+      this.surroundings.add(t);
+    }
   }
 
   setSurroundingsVisible(on: boolean) {
@@ -543,12 +660,14 @@ export class LaneLayer implements CustomLayerInterface {
         const face = new THREE.MeshBasicMaterial({ map: signalTexture() });
         const head = new THREE.Mesh(new THREE.BoxGeometry(0.34, 1.0, 0.28), [this.matPole, this.matPole, this.matPole, this.matPole, face, this.matPole]);
         head.position.y = 3.0;
+        pole.castShadow = head.castShadow = true;
         g.add(pole, head);
       } else {
         const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 2.3, 6), this.matSteel);
         pole.position.y = 1.15;
         const face = new THREE.Mesh(new THREE.PlaneGeometry(0.8, 0.8), new THREE.MeshBasicMaterial({ map: signFaceTexture(kind), transparent: true, side: THREE.DoubleSide }));
         face.position.set(0, 2.3, 0.05);
+        pole.castShadow = true;
         g.add(pole, face);
       }
       b.decor.add(g);
@@ -647,10 +766,12 @@ export class LaneLayer implements CustomLayerInterface {
       const beam = new THREE.Mesh(new THREE.BoxGeometry(span1 - span0, 0.35, 0.35), this.matSteel);
       beam.position.copy(at3((span0 + span1) / 2, H));
       beam.rotation.y = heading;
+      beam.castShadow = true;
       b.decor.add(beam);
       for (const off of [span0, span1]) {
         const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, H + 0.3, 10), this.matSteel);
         pole.position.copy(at3(off, (H + 0.3) / 2));
+        pole.castShadow = true;
         b.decor.add(pole);
       }
       for (const pn of panels) {
@@ -667,6 +788,7 @@ export class LaneLayer implements CustomLayerInterface {
         panel.position.copy(at3((pn.l + pn.r) / 2, H - 0.25 - (w * 0.625) / 2));
         panel.position.add(new THREE.Vector3(-d.x * 0.3, 0, -d.z * 0.3));
         panel.rotation.y = heading;
+        panel.castShadow = true;
         b.decor.add(panel);
       }
     }
@@ -725,6 +847,12 @@ export class LaneLayer implements CustomLayerInterface {
     this.asphaltMesh = new THREE.Mesh(g, this.matAsphalt);
     this.asphaltMesh.frustumCulled = false;
     this.roads.add(this.asphaltMesh);
+    this.roadShadow = new THREE.Mesh(g, this.matRoadShadow);
+    this.roadShadow.receiveShadow = true;
+    this.roadShadow.frustumCulled = false;
+    this.roadShadow.renderOrder = 5;
+    this.roadShadow.visible = !!this.opts.shadows;
+    this.roads.add(this.roadShadow);
     for (const [arr, mat] of [[white, this.matWhite], [centre, this.matCentre]] as const) {
       const lg = new THREE.BufferGeometry();
       lg.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
@@ -738,6 +866,7 @@ export class LaneLayer implements CustomLayerInterface {
       sg.setAttribute('position', new THREE.Float32BufferAttribute(structure, 3));
       sg.computeVertexNormals();
       const sm = new THREE.Mesh(sg, this.matStructure);
+      sm.castShadow = sm.receiveShadow = true;
       sm.frustumCulled = false;
       this.roads.add(sm);
     }
@@ -813,6 +942,27 @@ export class LaneLayer implements CustomLayerInterface {
     const { p, dir } = pointAt(b.pts, L * 0.5);
     return { center: this.unproject(p), bearing: (Math.atan2(dir.x, -dir.z) * 180) / Math.PI, length: L };
   }
+}
+
+/**
+ * A surface that is invisible except where a shadow falls on it: a Lambert material
+ * whose output is replaced by the shadow mask (so it takes polygon offset, side and
+ * render order like the road materials it is layered with).
+ */
+function shadowOnly(opacity: number, offset: number): THREE.Material {
+  const m = new THREE.MeshLambertMaterial({
+    color: 0x000000, transparent: true, opacity, depthWrite: false, side: THREE.DoubleSide,
+    polygonOffset: true, polygonOffsetFactor: offset, polygonOffsetUnits: offset,
+  });
+  m.onBeforeCompile = (shader) => {
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <shadowmap_pars_fragment>', '#include <shadowmap_pars_fragment>\n#include <shadowmask_pars_fragment>')
+      .replace(
+      '#include <opaque_fragment>',
+      'gl_FragColor = vec4( 0.0, 0.0, 0.0, opacity * ( 1.0 - getShadowMask() ) );',
+      );
+  };
+  return m;
 }
 
 /** Add points along a raised way so ramps follow the maximum grade instead of one long slope. */

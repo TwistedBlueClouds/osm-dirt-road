@@ -41,6 +41,8 @@
         <label class="slider" title="Road surface opacity: lower it to compare markings with the imagery">Surface
           <input id="opacity" type="range" min="0" max="1" step="0.05"></label>
         <label class="slider" title="Show buildings and trees"><input id="surroundings" type="checkbox"> Buildings</label>
+        <label class="slider" title="Time of day: moves the sun and the shadows">☀
+          <input id="sun" type="range" min="5.5" max="20.5" step="0.25"></label>
         <span id="view-hint">Drag to pan · right-drag or Ctrl+drag to tilt/rotate · click a lane to edit</span>
       </div>
     </section>
@@ -82,6 +84,12 @@
           <option value="green">Green</option>
         </select>
       </label>
+      <fieldset class="checks">
+        <legend>Graphics</legend>
+        <label><input type="checkbox" id="set-shadows"> Sun shadows</label>
+        <label><input type="checkbox" id="set-edges"> Building edge lines</label>
+        <label><input type="checkbox" id="set-aa"> Antialiasing <small>(applies after reload)</small></label>
+      </fieldset>
       <div class="row end">
         <button value="cancel">Cancel</button>
         <button value="save" class="primary">Save</button>

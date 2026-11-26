@@ -84,7 +84,7 @@ export class MapView {
   onOverlayClick: (wayId: number) => void = () => {};
   onAreaChange: (b: BBox | null) => void = () => {};
 
-  constructor(el: HTMLElement, basemap: Basemap) {
+  constructor(el: HTMLElement, basemap: Basemap, antialias = true) {
     this.map = new maplibregl.Map({
       container: el,
       style: style(basemap),
@@ -96,6 +96,8 @@ export class MapView {
       hash: 'map',
       boxZoom: false, // Shift+drag draws the load area instead
       attributionControl: { compact: true },
+      // Smooth edges for both the map and the 3D layer, which share this GL context.
+      canvasContextAttributes: { antialias },
     });
     this.map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-left');
     this.map.addControl(new maplibregl.ScaleControl({}), 'bottom-left');

@@ -12,23 +12,30 @@ const WALL = new THREE.Color(0xd8d2c8);
 const ROOF = new THREE.Color(0x8d8a86);
 
 const NAMED: Record<string, number> = {
-  white: 0xf2f2f2, black: 0x2b2b2b, grey: 0x8c8c8c, gray: 0x8c8c8c, red: 0xa8463c, brown: 0x7a5a44,
+  white: 0xf2f2f2, black: 0x1c1c1c, grey: 0x8c8c8c, gray: 0x8c8c8c, red: 0xa8463c, brown: 0x7a5a44,
   yellow: 0xe0c060, green: 0x5f8a5a, blue: 0x5f7fa8, beige: 0xd9cbb0, orange: 0xd08840, silver: 0xb8bcc0,
 };
 
 function colour(v: string | undefined, def: THREE.Color): THREE.Color {
   if (!v) return def;
   const k = v.trim().toLowerCase();
-  if (k in NAMED) return new THREE.Color(NAMED[k]);
-  if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/.test(k)) return new THREE.Color(k);
-  return def;
+  const c = k in NAMED ? new THREE.Color(NAMED[k]) : /^#([0-9a-f]{3}|[0-9a-f]{6})$/.test(k) ? new THREE.Color(k) : null;
+  if (!c) return def;
+  // Pure black swallows all shading; keep a little lightness so faces and shadows still read.
+  const hsl = { h: 0, s: 0, l: 0 };
+  c.getHSL(hsl);
+  return hsl.l < 0.16 ? c.setHSL(hsl.h, hsl.s, 0.16) : c;
 }
 
 /** Vendored geometry is (x east, y north, z up); the scene is (x east, y up, z south). */
 function pushTris(src: number[], pos: number[], col: number[], c: THREE.Color) {
-  for (let i = 0; i < src.length; i += 3) {
-    pos.push(src[i], src[i + 2], -src[i + 1]);
-    col.push(c.r, c.g, c.b);
+  // Triangles are emitted with two vertices swapped so the computed normals point outwards
+  // in this frame (shadow biasing relies on that).
+  for (let i = 0; i + 8 < src.length; i += 9) {
+    for (const k of [0, 6, 3]) {
+      pos.push(src[i + k], src[i + k + 2], -src[i + k + 1]);
+      col.push(c.r, c.g, c.b);
+    }
   }
 }
 

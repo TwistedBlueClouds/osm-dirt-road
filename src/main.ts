@@ -24,12 +24,16 @@ interface Settings {
   basemap: Basemap;
   roadOpacity: number;
   surroundings: boolean;
+  antialias: boolean;
+  shadows: boolean;
+  edges: boolean;
+  sunHour: number;
 }
 const SETTINGS_KEY = 'osm-lanes-3d.settings';
 const DRAFT_KEY = 'osm-lanes-3d.draft';
 
 function loadSettings(): Settings {
-  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true };
+  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true, antialias: true, shadows: true, edges: true, sunHour: 15 };
   try {
     return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') };
   } catch {
@@ -66,7 +70,7 @@ const status = (msg: string, error = false) => {
   el.classList.toggle('error', error);
 };
 
-const view = new MapView($('map'), settings.basemap);
+const view = new MapView($('map'), settings.basemap, settings.antialias);
 const scene = new LaneLayer(settings);
 scene.setRoadOpacity(settings.roadOpacity);
 scene.setSurroundingsVisible(settings.surroundings);
@@ -324,6 +328,12 @@ $('opacity').addEventListener('input', (e) => {
   saveSettings(settings);
   scene.setRoadOpacity(settings.roadOpacity);
 });
+($('sun') as HTMLInputElement).value = String(settings.sunHour);
+$('sun').addEventListener('input', (e) => {
+  settings.sunHour = Number((e.target as HTMLInputElement).value);
+  saveSettings(settings);
+  scene.setSun(settings.sunHour);
+});
 ($('surroundings') as HTMLInputElement).checked = settings.surroundings;
 $('surroundings').addEventListener('change', (e) => {
   settings.surroundings = (e.target as HTMLInputElement).checked;
@@ -439,6 +449,9 @@ function openSettings() {
   ($('set-side') as HTMLSelectElement).value = settings.drivingSide;
   ($('set-centre') as HTMLSelectElement).value = settings.centreLine;
   ($('set-sign') as HTMLSelectElement).value = settings.signStyle;
+  ($('set-aa') as HTMLInputElement).checked = settings.antialias;
+  ($('set-shadows') as HTMLInputElement).checked = settings.shadows;
+  ($('set-edges') as HTMLInputElement).checked = settings.edges;
   $('set-redirect').textContent = redirectUri();
   dlgSettings.showModal();
 }
@@ -452,8 +465,12 @@ dlgSettings.addEventListener('close', () => {
   setClientId(server, ($('set-client') as HTMLInputElement).value.trim());
   const serverChanged = server !== settings.server;
   if (serverChanged && modifiedWays().length && !confirm('Switching server discards loaded data and unsent edits. Continue?')) return;
+  const aaChanged = ($('set-aa') as HTMLInputElement).checked !== settings.antialias;
   settings = {
     ...settings,
+    antialias: ($('set-aa') as HTMLInputElement).checked,
+    shadows: ($('set-shadows') as HTMLInputElement).checked,
+    edges: ($('set-edges') as HTMLInputElement).checked,
     server,
     drivingSide: ($('set-side') as HTMLSelectElement).value as DrivingSide,
     centreLine: ($('set-centre') as HTMLSelectElement).value as Settings['centreLine'],
@@ -463,6 +480,9 @@ dlgSettings.addEventListener('close', () => {
   uploader = new Uploader(SERVERS[server], server);
   editor.server = SERVERS[server];
   scene.setOptions(settings);
+  scene.setShadows(settings.shadows);
+  scene.setBuildingEdges(settings.edges);
+  if (aaChanged) status('Antialiasing changes when the page is reloaded.');
   if (serverChanged) {
     data = null;
     scene.clear();
