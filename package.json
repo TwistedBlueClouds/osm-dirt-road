@@ -1,0 +1,36 @@
+{
+  "name": "osm-lanes-3d",
+  "version": "1.0.0",
+  "description": "3D visual editor for OpenStreetMap lane tagging: lanes, turn markings, lane changes and destinations",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc",
+    "test": "node --test test/*.test.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TwistedBlueClouds/osm-dirt-road.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/TwistedBlueClouds/osm-dirt-road/issues"
+  },
+  "homepage": "https://github.com/TwistedBlueClouds/osm-dirt-road#readme",
+  "dependencies": {
+    "leaflet": "^1.9.4",
+    "osm-auth": "^4.0.0",
+    "three": "^0.187.0"
+  },
+  "devDependencies": {
+    "@types/leaflet": "^1.9.23",
+    "@types/three": "^0.187.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  },
+  "type": "module",
+  "private": true
+}

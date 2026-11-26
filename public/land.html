@@ -1,0 +1,12 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Signing in…</title></head>
+<body>
+<p>Completing OpenStreetMap sign-in… you can close this window.</p>
+<script>
+  // osm-auth (v4) listens on this BroadcastChannel for the OAuth2 redirect URL.
+  var ch = new BroadcastChannel('osm-api-auth-complete');
+  ch.postMessage(window.location.href);
+  ch.close();
+  window.close();
+</script>
+</body></html>

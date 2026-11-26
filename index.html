@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OSM Lanes 3D</title>
+  <meta name="description" content="3D visual editor for OpenStreetMap lane tagging: lanes, turn markings, lane changes and destinations.">
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">OSM Lanes <b>3D</b></div>
+    <form id="search" autocomplete="off">
+      <input id="search-q" type="search" placeholder="Search a place…" aria-label="Search a place">
+      <div id="search-results" hidden></div>
+    </form>
+    <div class="group">
+      <button id="btn-draw" title="Draw the area to load (or Shift+drag on the map)">▭ Draw area</button>
+      <select id="source" title="Where to load data from">
+        <option value="api">OSM API</option>
+        <option value="overpass">Overpass (large areas)</option>
+      </select>
+      <button id="btn-load" class="primary">⤓ Load</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="group">
+      <button id="btn-undo" title="Undo (Ctrl+Z)" disabled>↶ Undo</button>
+      <button id="btn-upload" class="accent" disabled>⤒ Upload <span id="n-changes">0</span></button>
+      <button id="btn-account" title="OpenStreetMap account">Sign in</button>
+      <button id="btn-settings" title="Settings">⚙</button>
+    </div>
+  </header>
+
+  <main id="layout">
+    <section id="map" aria-label="Area map"></section>
+    <section id="view3d" aria-label="3D lane view">
+      <div class="overlay-tools">
+        <button id="btn-overview" title="Show whole area">⌂</button>
+        <span id="view-hint">Drag to orbit · right-drag to pan · scroll to zoom · click a lane to edit</span>
+      </div>
+    </section>
+    <aside id="editor" aria-label="Lane editor"></aside>
+  </main>
+
+  <footer id="status">Ready.</footer>
+
+  <dialog id="dlg-settings">
+    <form method="dialog">
+      <h2>Settings</h2>
+      <label>OSM server
+        <select id="set-server">
+          <option value="production">openstreetmap.org (live data)</option>
+          <option value="dev">master.apis.dev.openstreetmap.org (test server)</option>
+        </select>
+      </label>
+      <label>OAuth2 client ID for this server
+        <input id="set-client" placeholder="Register an app on the server, paste its client ID">
+      </label>
+      <p class="hint">Register an OAuth 2 application under <i>My Settings → OAuth 2 applications</i> on the chosen server,
+        as a public (non-confidential) app with the <code>read_prefs</code> and <code>write_api</code> permissions, and this redirect URI:<br>
+        <code id="set-redirect"></code></p>
+      <label>Driving side
+        <select id="set-side">
+          <option value="right">Right-hand traffic</option>
+          <option value="left">Left-hand traffic</option>
+        </select>
+      </label>
+      <label>Centre line colour
+        <select id="set-centre">
+          <option value="white">White (Europe, most of world)</option>
+          <option value="yellow">Yellow (Americas)</option>
+        </select>
+      </label>
+      <label>Sign colour
+        <select id="set-sign">
+          <option value="blue">Blue</option>
+          <option value="green">Green</option>
+        </select>
+      </label>
+      <div class="row end">
+        <button value="cancel">Cancel</button>
+        <button value="save" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-upload">
+    <form method="dialog">
+      <h2>Upload changes</h2>
+      <p id="up-server" class="hint"></p>
+      <div id="up-list"></div>
+      <label>Changeset comment <small>(required)</small>
+        <textarea id="up-comment" rows="2" required placeholder="e.g. Add turn lanes and destinations at …"></textarea>
+      </label>
+      <label>Source
+        <input id="up-source" value="survey" placeholder="survey; Bing; Mapillary…">
+      </label>
+      <label>Hashtags
+        <input id="up-hashtags" placeholder="#lanes">
+      </label>
+      <p id="up-msg" class="hint"></p>
+      <div class="row end">
+        <button type="button" id="up-osc">Download .osc</button>
+        <button value="cancel">Close</button>
+        <button type="button" id="up-go" class="accent">Upload</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
