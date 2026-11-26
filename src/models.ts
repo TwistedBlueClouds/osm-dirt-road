@@ -132,6 +132,23 @@ export class ModelLibrary {
     return this.loading;
   }
 
+  /** Size in metres of a model along its unit dimension. */
+  sizeOf(name: ModelName): number {
+    return (MODELS[name] as Def).size;
+  }
+
+  /** Empty instanced meshes for one model, to be filled and moved every frame. */
+  createInstanced(name: ModelName, capacity: number): THREE.InstancedMesh[] {
+    return (this.parts.get(name) ?? []).map((part) => {
+      const mesh = new THREE.InstancedMesh(part.geometry, part.material, capacity);
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      mesh.count = 0;
+      mesh.castShadow = true;
+      mesh.frustumCulled = false;
+      return mesh;
+    });
+  }
+
   /** Instanced meshes for a set of placements. */
   build(placements: Placement[]): THREE.Group {
     const group = new THREE.Group();

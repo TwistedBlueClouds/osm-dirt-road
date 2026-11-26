@@ -10,8 +10,8 @@
 // independent and much simpler.
 
 import { pointAt, polyLength, slice, type V2 } from './geom.ts';
-import type { DrivingSide, LaneSlot } from './lanes';
-import type { OsmRelation, OsmWay } from './osm';
+import type { DrivingSide, LaneSlot } from './lanes.ts';
+import type { OsmRelation, OsmWay } from './osm.ts';
 
 /** A way prepared for drawing: geometry in drawing direction plus its lane layout. */
 export interface WayGeo {

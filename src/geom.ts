@@ -61,7 +61,10 @@ export function slice(p: V2[], s0: number, s1: number): V2[] {
       const pa = { x: a.x + (b.x - a.x) * t0, z: a.z + (b.z - a.z) * t0, h: ha + (hb - ha) * t0 };
       const pb = { x: a.x + (b.x - a.x) * t1, z: a.z + (b.z - a.z) * t1, h: ha + (hb - ha) * t1 };
       if (!out.length) out.push(pa);
-      out.push(pb);
+      // A cut that lands exactly on a vertex would otherwise add a zero-length piece,
+      // which has no direction and skews anything offset from it.
+      const last = out[out.length - 1];
+      if (Math.hypot(pb.x - last.x, pb.z - last.z) > 1e-6) out.push(pb);
     }
     acc = e;
     if (acc > s1) break;
@@ -121,3 +124,9 @@ export function line(out: number[], p: V2[], offset: number, width: number, y: n
   }
 }
 
+
+/** A polyline shifted sideways by `off` metres (+ is right of its direction). */
+export function offsetLine(p: V2[], off: number): V2[] {
+  const n = vertexNormals(p);
+  return p.map((q, i) => ({ x: q.x + n[i].x * off, z: q.z + n[i].z * off, h: q.h }));
+}

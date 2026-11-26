@@ -225,3 +225,6 @@ details.fields summary { cursor: pointer; font-size: 13px; text-transform: upper
 .lane-h .tools { margin-left: auto; }
 .lane-h .tools button { padding: 1px 5px; }
 .lane { flex-basis: 268px; }
+#btn-traffic.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+#traffic-opts select { padding: 1px 4px; border: 0; background: transparent; }
+.overlay-tools { flex-wrap: wrap; right: 10px; }

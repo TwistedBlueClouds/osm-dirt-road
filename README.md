@@ -70,6 +70,19 @@ Unsent tag edits are kept as a draft in your browser and restored when you load 
 again, as long as nobody else has edited those ways in the meantime. Lane-connection edits
 are not part of the draft yet.
 
+### Traffic simulation
+
+**▶ Traffic** on the map starts a visual simulation: cars follow each lane and its connections
+through junctions (the same connections the editor shows), drive at the tagged speed limit
+(or a typical one for the road class where none is tagged), slow for turns, queue behind one
+another, give way when joining a road, take turns at junctions and stop at traffic signals.
+Choose light, normal or heavy traffic and 1×, 2× or 4× speed. Editing lanes, turn arrows,
+connections or speed limits rebuilds the traffic so you can see the effect.
+
+It is for looks and for sanity-checking lane tagging by eye, not a traffic model: routes are
+random, signal timings are invented, vehicles appear and disappear at the edges of the loaded
+area and at the ends of their short trips, and nothing is measured against real traffic.
+
 ### Limits worth knowing
 
 - The view draws what the tags say; it does not check them against the imagery.
@@ -122,6 +135,7 @@ settings, and add the Pages URL + `land.html` as a redirect URI on your OAuth ap
 - `src/speed.ts`: speed limit parsing and colours
 - `src/context.ts`: surrounding buildings and fallback trees
 - `src/models.ts`: low-poly models as instanced meshes
+- `src/traffic.ts`: the visual traffic simulation (lane graph, car following, signals)
 - `src/scenery.ts`: railway tracks and trains, boats, benches, model houses
 - `src/mapview.ts`: the map, backgrounds, area selection, zoomed-out road overlay
 - `src/textures.ts`: canvas-drawn arrows, lettering, signs and signals
