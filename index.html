@@ -47,6 +47,19 @@
           <input id="opacity" type="range" min="0" max="1" step="0.05"></label>
         <label class="slider" title="Show buildings and trees"><input id="surroundings" type="checkbox"> Buildings</label>
         <label class="slider" title="Show decorative parked cars and vehicles in the lanes"><input id="cars" type="checkbox"> Cars</label>
+        <button id="btn-traffic" title="Run a visual traffic simulation: cars follow the lanes and their connections at the speed limits">▶ Traffic</button>
+        <span id="traffic-opts" class="slider" hidden>
+          <select id="traffic-density" title="How much traffic">
+            <option value="5">Light</option>
+            <option value="10">Normal</option>
+            <option value="18">Heavy</option>
+          </select>
+          <select id="traffic-speed" title="Simulation speed">
+            <option value="1">1×</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+          </select>
+        </span>
         <label class="slider" title="Time of day: moves the sun and the shadows">☀
           <input id="sun" type="range" min="5.5" max="20.5" step="0.25"></label>
         <span id="view-hint">Drag to pan · right-drag or Ctrl+drag to tilt/rotate · click a lane to edit</span>

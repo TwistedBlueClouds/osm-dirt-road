@@ -13,9 +13,10 @@ import { line, pointAt, polyLength, slice, strip, vertexNormals, type V2 } from 
 import { isModified, type OsmData, type OsmWay } from './osm';
 import { connectionCurve, connectionsFrom, solveJunctions, type Arm, type Connection, type WayGeo } from './junctions';
 import { laneKind, layoutLanes, layoutSide, mayChange, parseRoad, type DrivingSide, type LaneSlot, type SideStrip } from './lanes';
-import { BROADLEAF, CARS, CONIFERS, LARGE_VEHICLES, ModelLibrary, hash2, type Placement } from './models';
+import { BROADLEAF, CARS, CONIFERS, LARGE_VEHICLES, ModelLibrary, hash2, type ModelName, type Placement } from './models';
 import { benchPlacements, boatPlacements, buildRails, housePlacements } from './scenery';
 import { speedColour } from './speed';
+import { TrafficSim, type VehicleKind } from './traffic';
 import { arrowTexture, bikeTexture, roadTextTexture, signFaceTexture, signTexture, signalTexture, type SignStyle } from './textures';
 
 export type ColourBy = 'surface' | 'speed' | 'tags';
@@ -63,6 +64,11 @@ function surfaceColor(tags: Record<string, string>): THREE.Color {
   return new THREE.Color(0x3a3c40);
 }
 
+/** Vehicle models in moving traffic and their relative share (0 = taxi lanes only). */
+const TRAFFIC_MODELS: [ModelName, number][] = [
+  ['sedan', 5], ['hatchback', 5], ['suv', 4], ['sedan-sports', 2], ['suv-luxury', 2], ['van', 2], ['taxi', 1.5], ['delivery', 1], ['truck', 1],
+];
+
 const KIND_COLOR: Partial<Record<string, THREE.Color>> = {
   bus: new THREE.Color(0x7a3d38), psv: new THREE.Color(0x7a3d38), taxi: new THREE.Color(0x7a3d38),
   bicycle: new THREE.Color(0x3d7a58), restricted: new THREE.Color(0x26272a),
@@ -84,8 +90,10 @@ interface Built {
   triSlot: number[];
   white: number[];
   centre: number[];
-  /** Decorative vehicles on this way. */
+  /** Parked vehicles on this way. */
   cars: Placement[];
+  /** Vehicles standing in the lanes (replaced by moving traffic when the simulation runs). */
+  laneCars: Placement[];
   /** Bridge decks, parapets, piers and ramp walls. */
   structure: number[];
   /** 1 = normal, lower for tunnels. */
@@ -126,6 +134,14 @@ export class LaneLayer implements CustomLayerInterface {
   private hoverGroup = new THREE.Group();
   private models = new ModelLibrary();
   private vehicles = new THREE.Group();
+  private sim = new TrafficSim();
+  private trafficOn = false;
+  private trafficDensity = 10;
+  private trafficSpeed = 1;
+  private trafficGroup = new THREE.Group();
+  /** One set of instanced meshes per vehicle kind, in the order of TRAFFIC_MODELS. */
+  private trafficMeshes: THREE.InstancedMesh[][] = [];
+  private lastFrame = 0;
   opts: SceneOptions;
 
   private matAsphalt = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.85 });
@@ -155,11 +171,12 @@ export class LaneLayer implements CustomLayerInterface {
   constructor(opts: SceneOptions) {
     this.opts = opts;
     this.matCentre.color.set(opts.centreLine === 'yellow' ? 0xf2c21b : 0xf2f2ee);
-    this.root.add(this.surroundings, this.roads, this.vehicles, this.decor, this.highlight, this.hoverGroup);
+    this.root.add(this.surroundings, this.roads, this.vehicles, this.trafficGroup, this.decor, this.highlight, this.hoverGroup);
     // Models arrive after the first draw; until then trees are simple shapes and there are no cars.
     void this.models.load().then(() => {
       this.rebuildSurroundings();
       this.rebuildVehicles();
+      if (this.trafficOn) this.rebuildTraffic();
     });
     this.scene.add(this.root);
     this.scene.add(this.hemi, this.sun, this.sun.target);
@@ -266,6 +283,7 @@ export class LaneLayer implements CustomLayerInterface {
     this.renderer.resetState();
     this.renderer.setViewport(0, 0, canvas.width, canvas.height);
     if (this.opts.shadows) this.aimSun();
+    if (this.trafficOn) this.stepTraffic();
     // MapLibre narrows the depth range for its 3D pass. A shadow map written under that
     // range no longer matches the depths the shaders compare against, so use the full
     // range while Three draws and hand MapLibre's back afterwards.
@@ -442,10 +460,101 @@ export class LaneLayer implements CustomLayerInterface {
     this.vehicles.clear();
     if (this.models.ready && this.opts.cars !== false) {
       const all: Placement[] = [];
-      for (const b of this.built.values()) for (const c of b.cars) all.push(c);
+      for (const b of this.built.values()) {
+        for (const c of b.cars) all.push(c);
+        if (!this.trafficOn) for (const c of b.laneCars) all.push(c);
+      }
       this.vehicles.add(this.models.build(all));
     }
     this.repaint();
+  }
+
+  // ---- moving traffic (see traffic.ts) ---------------------------------------
+
+  /** Do the lanes arriving at this end of a way meet traffic signals? */
+  private signalled(geo: WayGeo, end: 'start' | 'end'): boolean {
+    const d = this.data!;
+    const ids = geo.reversed ? geo.way.nodes.slice().reverse() : geo.way.nodes;
+    // Signals are mapped on the junction node or on a node shortly before it.
+    return ids.some((id, i) => {
+      const fromEnd = end === 'end' ? geo.L - geo.nodeS[i] : geo.nodeS[i];
+      return fromEnd < 32 && d.nodes.get(id)?.tags?.highway === 'traffic_signals';
+    });
+  }
+
+  private rebuildTraffic() {
+    this.trafficGroup.traverse((o) => {
+      if (o instanceof THREE.InstancedMesh) o.dispose();
+    });
+    this.trafficGroup.clear();
+    this.trafficMeshes = [];
+    if (!this.data || !this.models.ready) return;
+    const kinds: VehicleKind[] = TRAFFIC_MODELS.map(([model, weight]) => ({ length: this.models.sizeOf(model), weight, taxi: model === 'taxi' }));
+    this.sim.build(this.geos, (id) => this.connectionsOf(id), (g, end) => this.signalled(g, end), kinds, this.armsAt);
+    this.sim.populate(this.trafficDensity);
+    const share = (w: number) => Math.ceil(900 * (w / TRAFFIC_MODELS.reduce((a, [, x]) => a + x, 0)) * 1.6) + 40;
+    for (const [model, weight] of TRAFFIC_MODELS) {
+      const meshes = this.models.createInstanced(model, share(weight || 3));
+      this.trafficMeshes.push(meshes);
+      for (const mesh of meshes) this.trafficGroup.add(mesh);
+    }
+    this.lastFrame = performance.now();
+  }
+
+  private stepTraffic() {
+    const now = performance.now();
+    // Long gaps (tab in the background, a slow frame) must not teleport the cars.
+    const dt = Math.min((now - this.lastFrame) / 1000, 0.1) * this.trafficSpeed;
+    this.lastFrame = now;
+    if (dt > 0) this.sim.step(dt);
+    const counts = this.trafficMeshes.map(() => 0);
+    const m = new THREE.Matrix4();
+    const q = new THREE.Quaternion();
+    const up = new THREE.Vector3(0, 1, 0);
+    const pos = new THREE.Vector3();
+    const scale = new THREE.Vector3();
+    for (const car of this.sim.cars) {
+      const meshes = this.trafficMeshes[car.kind];
+      if (!meshes?.length) continue;
+      const i = counts[car.kind];
+      if (i >= meshes[0].instanceMatrix.count) continue;
+      counts[car.kind]++;
+      q.setFromAxisAngle(up, car.heading);
+      m.compose(pos.set(car.x, car.y, car.z), q, scale.setScalar(car.len));
+      for (const mesh of meshes) mesh.setMatrixAt(i, m);
+    }
+    this.trafficMeshes.forEach((meshes, k) => {
+      for (const mesh of meshes) {
+        mesh.count = counts[k];
+        mesh.instanceMatrix.needsUpdate = true;
+      }
+    });
+    // Keep the map drawing while traffic moves.
+    this.map?.triggerRepaint();
+  }
+
+  /** Start or stop the moving-traffic simulation. */
+  setTraffic(on: boolean) {
+    this.trafficOn = on;
+    this.trafficGroup.visible = on;
+    if (on) this.rebuildTraffic();
+    this.rebuildVehicles();
+  }
+
+  /** Vehicles per kilometre of lane. */
+  setTrafficDensity(perKm: number) {
+    this.trafficDensity = perKm;
+    if (this.trafficOn) this.sim.populate(perKm);
+    this.repaint();
+  }
+
+  /** Time multiplier: 1 is real time. */
+  setTrafficSpeed(x: number) {
+    this.trafficSpeed = x;
+  }
+
+  trafficCount(): number {
+    return this.trafficOn ? this.sim.cars.length : 0;
   }
 
   setModelHouses(on: boolean) {
@@ -496,6 +605,7 @@ export class LaneLayer implements CustomLayerInterface {
     }
     this.merge();
     this.rebuildVehicles();
+    if (this.trafficOn) this.rebuildTraffic();
   }
 
   /**
@@ -562,7 +672,7 @@ export class LaneLayer implements CustomLayerInterface {
     const raised = pts.some((p) => (p.h ?? 0) > 0.05);
     const b: Built = {
       way: w, pts, slots, asphalt: [], triColor: [], triSlot: [],
-      white: [], centre: [], cars: [], structure: [], alpha: isTunnel(w.tags) ? 0.45 : 1, decor: new THREE.Group(),
+      white: [], centre: [], cars: [], laneCars: [], structure: [], alpha: isTunnel(w.tags) ? 0.45 : 1, decor: new THREE.Group(),
     };
     if (pts.length < 2) return b;
 
@@ -759,7 +869,7 @@ export class LaneLayer implements CustomLayerInterface {
         if (r > 0.26) continue;
         const { p, dir } = pointAt(pts, at);
         const pick = hash2(k, id);
-        b.cars.push({
+        b.laneCars.push({
           model: kind === 'taxi' ? 'taxi' : pick < 0.12 ? LARGE_VEHICLES[Math.floor(pick / 0.12 * LARGE_VEHICLES.length)] : pick < 0.2 ? 'taxi' : CARS[Math.floor(pick * 97) % CARS.length],
           x: p.x - dir.z * lateral, y: p.h ?? 0, z: p.z + dir.x * lateral,
           heading: Math.atan2(dir.x, dir.z),

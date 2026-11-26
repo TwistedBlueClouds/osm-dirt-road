@@ -33,12 +33,14 @@ interface Settings {
   colourBy: ColourBy;
   cars: boolean;
   modelHouses: boolean;
+  trafficDensity: number;
+  trafficSpeed: number;
 }
 const SETTINGS_KEY = 'osm-lanes-3d.settings';
 const DRAFT_KEY = 'osm-lanes-3d.draft';
 
 function loadSettings(): Settings {
-  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true, antialias: true, shadows: true, edges: true, sunHour: 15, colourBy: 'surface', cars: true, modelHouses: true };
+  const def: Settings = { server: 'production', drivingSide: 'right', centreLine: 'white', signStyle: 'blue', basemap: 'imagery', roadOpacity: 0.85, surroundings: true, antialias: true, shadows: true, edges: true, sunHour: 15, colourBy: 'surface', cars: true, modelHouses: true, trafficDensity: 10, trafficSpeed: 1 };
   try {
     return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') };
   } catch {
@@ -488,6 +490,39 @@ $('sun').addEventListener('input', (e) => {
   saveSettings(settings);
   scene.setSun(settings.sunHour);
 });
+// Moving traffic: off until asked for, since it keeps the map redrawing.
+let trafficOn = false;
+scene.setTrafficDensity(settings.trafficDensity);
+scene.setTrafficSpeed(settings.trafficSpeed);
+($('traffic-density') as HTMLSelectElement).value = String(settings.trafficDensity);
+($('traffic-speed') as HTMLSelectElement).value = String(settings.trafficSpeed);
+const showTraffic = () => {
+  $('btn-traffic').textContent = trafficOn ? '⏸ Traffic' : '▶ Traffic';
+  $('btn-traffic').classList.toggle('on', trafficOn);
+  $('traffic-opts').hidden = !trafficOn;
+};
+$('btn-traffic').addEventListener('click', () => {
+  if (!data) {
+    status('Load an area first, then start the traffic.', true);
+    return;
+  }
+  trafficOn = !trafficOn;
+  scene.setTraffic(trafficOn);
+  showTraffic();
+  status(trafficOn ? `Traffic running: ${scene.trafficCount()} vehicles. This is a visual simulation, not real traffic data.` : 'Traffic stopped.');
+});
+$('traffic-density').addEventListener('change', (e) => {
+  settings.trafficDensity = Number((e.target as HTMLSelectElement).value);
+  saveSettings(settings);
+  scene.setTrafficDensity(settings.trafficDensity);
+  if (trafficOn) status(`Traffic running: ${scene.trafficCount()} vehicles.`);
+});
+$('traffic-speed').addEventListener('change', (e) => {
+  settings.trafficSpeed = Number((e.target as HTMLSelectElement).value);
+  saveSettings(settings);
+  scene.setTrafficSpeed(settings.trafficSpeed);
+});
+showTraffic();
 ($('cars') as HTMLInputElement).checked = settings.cars;
 $('cars').addEventListener('change', (e) => {
   settings.cars = (e.target as HTMLInputElement).checked;
