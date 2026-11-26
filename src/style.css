@@ -189,3 +189,9 @@ dialog label > input, dialog label > select, dialog label > textarea { display: 
 #up-list { max-height: 260px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
 #up-list h4 { margin: 6px 0 2px; font-size: 13px; }
 #up-msg.error { color: #c62828; }
+
+.sides { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.lane.side { flex: none; }
+.lane.side .check { margin-top: 8px; color: var(--ink); }
+.lane.side label.check { display: flex; align-items: center; gap: 6px; }
+.lane.side label.check input { width: auto; margin: 0; }

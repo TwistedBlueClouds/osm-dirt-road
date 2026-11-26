@@ -11,11 +11,16 @@ export type Dir = 'forward' | 'backward';
 export type Oneway = 'no' | 'yes' | '-1';
 export type DrivingSide = 'right' | 'left';
 
-/** Per-lane attributes this editor manages. Key = OSM key prefix. */
-export const LANE_KEYS = ['turn', 'destination', 'destination:ref', 'change', 'width'] as const;
+/** Per-lane attributes the editor has fields for. Key = OSM key prefix. */
+export const LANE_KEYS = ['turn', 'destination', 'destination:ref', 'change', 'width', 'maxspeed'] as const;
 export type LaneKey = (typeof LANE_KEYS)[number];
 
-export type Lane = Record<LaneKey, string>;
+/**
+ * One lane's values, keyed by OSM key prefix (`turn` for `turn:lanes`). The core keys are
+ * always present; any other `*:lanes` key on the way (`bus`, `access`, `hgv`, …) is carried
+ * along too, so adding or removing a lane keeps every per-lane tag aligned.
+ */
+export type Lane = Record<LaneKey, string> & Record<string, string>;
 
 export const TURN_VALUES = [
   'sharp_left', 'left', 'slight_left', 'through', 'slight_right', 'right', 'sharp_right',
@@ -32,10 +37,12 @@ export interface RoadModel {
   bothWays: Lane | null;
   /** True when lane counts were guessed (no lanes tags present). */
   implied: boolean;
+  /** Tag keys the model was read from; rewritten (or removed) by writeRoad. */
+  parsedKeys: string[];
 }
 
 export function emptyLane(): Lane {
-  return { turn: '', destination: '', 'destination:ref': '', change: '', width: '' };
+  return { turn: '', destination: '', 'destination:ref': '', change: '', width: '', maxspeed: '' };
 }
 
 const TRUTHY = new Set(['yes', 'true', '1']);
@@ -61,7 +68,7 @@ function split(v: string | undefined): string[] | undefined {
 }
 
 /** Tag key for a lane attribute in a given direction. */
-export function laneTagKey(key: LaneKey, oneway: boolean, dir: Dir | 'both_ways'): string {
+export function laneTagKey(key: string, oneway: boolean, dir: Dir | 'both_ways'): string {
   if (dir === 'both_ways') return `${key}:lanes:both_ways`;
   return oneway ? `${key}:lanes` : `${key}:lanes:${dir}`;
 }
@@ -72,9 +79,17 @@ export function parseRoad(tags: Tags): RoadModel {
   const total = int(tags.lanes);
   const both = Math.min(int(tags['lanes:both_ways']) ?? 0, 1);
 
+  // Every `<prefix>:lanes[:forward|:backward|:both_ways]` key on the way.
+  const prefixes = new Set<string>(LANE_KEYS);
+  for (const k of Object.keys(tags)) {
+    const mm = /^(.+):lanes(?::(?:forward|backward|both_ways))?$/.exec(k);
+    if (mm) prefixes.add(mm[1]);
+  }
+  const parsedKeys: string[] = [];
+
   const counted = (dir: Dir): number | undefined => {
     let n: number | undefined;
-    for (const k of LANE_KEYS) {
+    for (const k of prefixes) {
       const parts = split(tags[laneTagKey(k, isOneway, dir)]);
       if (parts) n = Math.max(n ?? 0, parts.length);
     }
@@ -112,13 +127,17 @@ export function parseRoad(tags: Tags): RoadModel {
 
   const build = (dir: Dir, n: number): Lane[] => {
     const lanes = Array.from({ length: n }, emptyLane);
-    for (const k of LANE_KEYS) {
-      let parts = split(tags[laneTagKey(k, isOneway, dir)]);
-      // Tolerate the plain `*:lanes` form on the forward side of a two-way road.
-      if (!parts && !isOneway && dir === 'forward' && nb === 0) parts = split(tags[`${k}:lanes`]);
-      parts?.forEach((v, i) => {
-        if (i < n) lanes[i][k] = v;
-      });
+    for (const k of prefixes) {
+      let key = laneTagKey(k, isOneway, dir);
+      let parts = split(tags[key]);
+      // Tolerate the plain `*:lanes` form on a two-way road that has no backward lanes.
+      if (!parts && !isOneway && dir === 'forward' && nb === 0) {
+        key = `${k}:lanes`;
+        parts = split(tags[key]);
+      }
+      if (!parts) continue;
+      parsedKeys.push(key);
+      lanes.forEach((l, i) => (l[k] = parts![i] ?? ''));
     }
     return lanes;
   };
@@ -126,31 +145,26 @@ export function parseRoad(tags: Tags): RoadModel {
   let bothWays: Lane | null = null;
   if (both && !isOneway) {
     bothWays = emptyLane();
-    for (const k of LANE_KEYS) {
-      const v = tags[laneTagKey(k, false, 'both_ways')];
-      if (v !== undefined) bothWays[k] = v;
-    }
-    if (!bothWays.turn) bothWays.turn = '';
-  }
-
-  return { oneway, forward: build('forward', nf), backward: build('backward', nb), bothWays, implied };
-}
-
-/** Remove every key this module manages so the model can be rewritten cleanly. */
-function clearLaneTags(tags: Tags): void {
-  for (const k of Object.keys(tags)) {
-    if (/^(lanes(:forward|:backward|:both_ways)?)$/.test(k)) delete tags[k];
-    for (const lk of LANE_KEYS) {
-      if (k === `${lk}:lanes` || k.startsWith(`${lk}:lanes:`)) delete tags[k];
+    for (const k of prefixes) {
+      const key = laneTagKey(k, false, 'both_ways');
+      if (tags[key] !== undefined) {
+        bothWays[k] = tags[key];
+        parsedKeys.push(key);
+      }
     }
   }
+
+  const forward = build('forward', nf);
+  const backward = build('backward', nb);
+  for (const k of ['lanes', 'lanes:forward', 'lanes:backward', 'lanes:both_ways']) if (k in tags) parsedKeys.push(k);
+  return { oneway, forward, backward, bothWays, implied, parsedKeys };
 }
 
 /** Write the model into a copy of `tags` and return it. */
 export function writeRoad(orig: Tags, m: RoadModel): Tags {
   const tags = { ...orig };
   const hadForwardCount = 'lanes:forward' in orig || 'lanes:backward' in orig;
-  clearLaneTags(tags);
+  for (const k of m.parsedKeys) delete tags[k];
 
   // oneway: avoid redundant tags where the highway type already implies it.
   const withoutOneway = { ...orig };
@@ -176,20 +190,17 @@ export function writeRoad(orig: Tags, m: RoadModel): Tags {
   }
   if (both) tags['lanes:both_ways'] = '1';
 
-  const put = (dir: Dir, lanes: Lane[]) => {
-    for (const k of LANE_KEYS) {
-      const vals = lanes.map((l) => l[k].trim());
+  const put = (dir: Dir | 'both_ways', lanes: Lane[]) => {
+    const keys = new Set<string>();
+    for (const l of lanes) for (const k of Object.keys(l)) keys.add(k);
+    for (const k of keys) {
+      const vals = lanes.map((l) => (l[k] ?? '').trim());
       if (vals.some((v) => v !== '')) tags[laneTagKey(k, isOneway, dir)] = vals.join('|');
     }
   };
   put('forward', m.forward);
   if (!isOneway) put('backward', m.backward);
-  if (both && m.bothWays) {
-    for (const k of LANE_KEYS) {
-      const v = m.bothWays[k].trim();
-      if (v) tags[laneTagKey(k, false, 'both_ways')] = v;
-    }
-  }
+  if (both && m.bothWays) put('both_ways', [m.bothWays]);
   return tags;
 }
 
@@ -297,7 +308,7 @@ export function validate(tags: Tags): Warning[] {
     const n = v.split('|').length;
     if (!mm[2] && !isOneway && k !== 'lanes') {
       out.push({ level: 'warn', text: `${k} on a two-way road is ambiguous; use ${k}:forward / :backward` });
-    } else if (n !== expect && (LANE_KEYS as readonly string[]).includes(mm[1])) {
+    } else if (n !== expect) {
       out.push({ level: 'warn', text: `${k} has ${n} values, expected ${expect}` });
     }
     if (mm[1] === 'turn') {
@@ -318,5 +329,140 @@ export function validate(tags: Tags): Warning[] {
     }
   }
   if (m.implied) out.push({ level: 'info', text: 'No lane tags yet: showing an assumed 1 + 1 layout.' });
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Lane types. The rules follow Lane Studio's lane kinds (ISC, © Lane Studio contributors,
+// https://github.com/MarcelMarzec/LaneStudio, modules/lanes/model/kinds.ts): `designated`
+// in a type's `*:lanes` key reserves the lane for it; a lane closed to general traffic is
+// "restricted" unless it is open to one of the types.
+
+export const LANE_KINDS = ['general', 'bus', 'psv', 'taxi', 'hov', 'bicycle', 'restricted'] as const;
+export type LaneKind = (typeof LANE_KINDS)[number];
+
+const KIND_KEY: Record<string, string> = { bus: 'bus', psv: 'psv', taxi: 'taxi', hov: 'hov', bicycle: 'bicycle' };
+const RESERVED = ['bus', 'psv', 'taxi', 'hov', 'bicycle'] as const;
+const CLOSING_KEYS = ['access', 'motor_vehicle', 'vehicle'];
+const isClosed = (v: string | undefined) => v === 'no' || v === 'private';
+const isOpen = (v: string | undefined) => v === 'yes' || v === 'designated' || v === 'permissive';
+
+export function laneKind(l: Lane, highway?: string): LaneKind {
+  for (const k of RESERVED) if (l[KIND_KEY[k]] === 'designated') return k;
+  if (l.cycleway === 'lane') return 'bicycle';
+  if (CLOSING_KEYS.some((k) => isClosed(l[k]))) {
+    for (const k of RESERVED) if (isOpen(l[KIND_KEY[k]])) return k;
+    return 'restricted';
+  }
+  return highway === 'busway' ? 'bus' : 'general';
+}
+
+/** Change a lane's type in place, clearing the other types' markers. */
+export function setLaneKind(l: Lane, kind: LaneKind): void {
+  for (const k of RESERVED) {
+    if (l[KIND_KEY[k]] === 'designated' || (kind === 'general' && isOpen(l[KIND_KEY[k]]))) l[KIND_KEY[k]] = '';
+  }
+  if (l.cycleway === 'lane') l.cycleway = '';
+  for (const k of CLOSING_KEYS) if (isClosed(l[k])) l[k] = '';
+  if (kind === 'restricted') l.access = 'no';
+  else if (kind !== 'general') l[KIND_KEY[kind]] = 'designated';
+}
+
+// ---------------------------------------------------------------------------
+// Roadside: what runs along each side of the carriageway (not counted in `lanes`).
+
+export type Side = 'left' | 'right';
+
+export interface Roadside {
+  /** '' (not tagged), yes, no, separate */
+  sidewalk: string;
+  /** '', lane, track, no, separate, … */
+  cycleway: string;
+  /** '', lane, street_side, no, separate, … */
+  parking: string;
+  shoulder: boolean;
+}
+
+function sideValue(tags: Tags, key: string, side: Side): string {
+  return tags[`${key}:${side}`] ?? tags[`${key}:both`] ?? '';
+}
+
+export function parseRoadside(tags: Tags, side: Side): Roadside {
+  let sidewalk = sideValue(tags, 'sidewalk', side);
+  if (!sidewalk && tags.sidewalk) {
+    const v = tags.sidewalk;
+    sidewalk = v === 'both' || v === side ? 'yes' : v === 'left' || v === 'right' || v === 'no' || v === 'none' ? 'no' : v === 'separate' ? 'separate' : '';
+  }
+  const cycleway = sideValue(tags, 'cycleway', side) || tags.cycleway || '';
+  const parking = sideValue(tags, 'parking', side);
+  const sh = tags[`shoulder:${side}`] ?? tags['shoulder:both'] ?? tags.shoulder ?? '';
+  const shoulder = sh === 'yes' || sh === 'both' || sh === side;
+  return { sidewalk, cycleway, parking, shoulder };
+}
+
+/** Write both sides back, using the shortest conventional form for each key. */
+export function writeRoadside(orig: Tags, left: Roadside, right: Roadside): Tags {
+  const tags = { ...orig };
+  const perSide = (key: string, l: string, r: string) => {
+    delete tags[`${key}:left`];
+    delete tags[`${key}:right`];
+    delete tags[`${key}:both`];
+    if (l && l === r) tags[`${key}:both`] = l;
+    else {
+      if (l) tags[`${key}:left`] = l;
+      if (r) tags[`${key}:right`] = r;
+    }
+  };
+  // sidewalk: the plain key when it can say it, per-side keys otherwise
+  delete tags.sidewalk;
+  const [sl, sr] = [left.sidewalk, right.sidewalk];
+  const simple = (v: string) => v === 'yes' || v === 'no' || v === '';
+  if (sl === 'separate' && sr === 'separate') perSide('sidewalk', '', ''), (tags.sidewalk = 'separate');
+  else if (simple(sl) && simple(sr) && (sl || sr)) {
+    perSide('sidewalk', '', '');
+    tags.sidewalk = sl === 'yes' && sr === 'yes' ? 'both' : sl === 'yes' ? 'left' : sr === 'yes' ? 'right' : 'no';
+  } else perSide('sidewalk', sl, sr);
+
+  delete tags.cycleway;
+  perSide('cycleway', left.cycleway, right.cycleway);
+  perSide('parking', left.parking, right.parking);
+
+  delete tags.shoulder;
+  delete tags['shoulder:left'];
+  delete tags['shoulder:right'];
+  delete tags['shoulder:both'];
+  if (left.shoulder && right.shoulder) tags.shoulder = 'both';
+  else if (left.shoulder) tags.shoulder = 'left';
+  else if (right.shoulder) tags.shoulder = 'right';
+  else if (orig.shoulder === 'no') tags.shoulder = 'no';
+  return tags;
+}
+
+export interface SideStrip {
+  kind: 'shoulder' | 'cycle' | 'parking' | 'sidewalk';
+  /** Offsets like LaneSlot: + is right of the drawing direction. */
+  left: number;
+  right: number;
+}
+
+/**
+ * Strips outside the carriageway on one side, from the carriageway edge outwards.
+ * `dir` is which way "outwards" is in drawing offsets (it differs from `side` when the
+ * geometry is drawn reversed for oneway=-1).
+ */
+export function layoutSide(tags: Tags, side: Side, edge: number, dir: -1 | 1 = side === 'left' ? -1 : 1): SideStrip[] {
+  const r = parseRoadside(tags, side);
+  const out: SideStrip[] = [];
+  let x = edge;
+  const add = (kind: SideStrip['kind'], w: number) => {
+    const a = x;
+    x += dir * w;
+    out.push({ kind, left: Math.min(a, x), right: Math.max(a, x) });
+  };
+  if (r.shoulder) add('shoulder', 2.5);
+  if (r.cycleway === 'lane') add('cycle', 1.6);
+  if (r.parking === 'lane' || r.parking === 'street_side') add('parking', tags[`parking:${side}:orientation`] === 'perpendicular' ? 5 : tags[`parking:${side}:orientation`] === 'diagonal' ? 4.2 : 2.2);
+  if (r.cycleway === 'track') add('cycle', 1.8);
+  if (r.sidewalk === 'yes') add('sidewalk', 2.2);
   return out;
 }

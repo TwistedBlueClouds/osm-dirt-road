@@ -1,10 +1,14 @@
 // Side panel: structured per-lane editor plus a raw tag editor.
 
 import {
-  CHANGE_VALUES, TURN_VALUES, emptyLane, parseRoad, validate, writeRoad,
-  type Dir, type Lane, type LaneKey, type RoadModel,
+  CHANGE_VALUES, LANE_KINDS, TURN_VALUES, emptyLane, laneKind, parseRoad, parseRoadside, setLaneKind, validate, writeRoad, writeRoadside,
+  type Dir, type Lane, type LaneKey, type LaneKind, type RoadModel, type Roadside, type Side,
 } from './lanes';
 import { diffTags, type OsmWay, type ServerConfig, type Tags } from './osm';
+
+const KIND_NAME: Record<LaneKind, string> = {
+  general: 'General', bus: 'Bus', psv: 'Bus + taxi (PSV)', taxi: 'Taxi', hov: 'HOV', bicycle: 'Cycle', restricted: 'No access',
+};
 
 const TURN_GLYPH: Record<string, string> = {
   sharp_left: '↙', left: '←', slight_left: '↖', through: '↑', slight_right: '↗', right: '→',
@@ -138,6 +142,14 @@ export class LaneEditor {
       ${m.bothWays ? `<section class="dir"><h3>Centre two-way lane</h3><div class="lanes" data-dir="both_ways">${this.laneCard('both_ways', 0, m.bothWays)}</div></section>` : ''}
       ${isOneway ? '' : dirSection('backward', m.backward, 'Backward ← (against way direction)')}
 
+      <section class="dir roadside">
+        <h3>Roadside</h3>
+        <div class="sides">
+          ${(['left', 'right'] as Side[]).map((side) => this.sideCard(side, parseRoadside(w.tags, side))).join('')}
+        </div>
+        <p class="hint">Left and right are relative to the way's direction. These are not counted in <code>lanes</code>.</p>
+      </section>
+
       ${warnings.length ? `<section class="warnings">${warnings.map((x) => `<div class="${x.level}">${h(x.text)}</div>`).join('')}</section>` : ''}
 
       <details class="raw" ${changed ? 'open' : ''}>
@@ -153,6 +165,20 @@ export class LaneEditor {
     `;
   }
 
+  private sideCard(side: Side, r: Roadside): string {
+    const sel = (f: keyof Roadside, cur: string, opts: [string, string][]) => `
+      <select data-side="${side}" data-f="${f}">${opts.map(([v, label]) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${label}</option>`).join('')}
+      ${opts.some(([v]) => v === cur) ? '' : `<option selected value="${h(cur)}">${h(cur)}</option>`}</select>`;
+    return `
+      <div class="lane side">
+        <div class="lane-h"><span>${side === 'left' ? 'Left side' : 'Right side'}</span></div>
+        <label>Pavement ${sel('sidewalk', r.sidewalk, [['', '—'], ['yes', 'yes'], ['no', 'no'], ['separate', 'mapped separately']])}</label>
+        <label>Cycleway ${sel('cycleway', r.cycleway, [['', '—'], ['lane', 'lane (on road)'], ['track', 'track (beside road)'], ['no', 'no'], ['separate', 'mapped separately']])}</label>
+        <label>Parking ${sel('parking', r.parking, [['', '—'], ['lane', 'on the carriageway'], ['street_side', 'in bays beside it'], ['no', 'no'], ['separate', 'mapped separately']])}</label>
+        <label class="check"><input type="checkbox" data-side="${side}" data-f="shoulder" ${r.shoulder ? 'checked' : ''}> Hard shoulder</label>
+      </div>`;
+  }
+
   private laneCard(dir: Dir | 'both_ways', i: number, l: Lane): string {
     const turns = new Set(l.turn.split(';').filter(Boolean));
     const focused = this.focus && this.focus.dir === dir && this.focus.index === i;
@@ -165,6 +191,12 @@ export class LaneEditor {
             <button data-act="ins-left" title="Insert a lane to the left">+◂</button>
             <button data-act="ins-right" title="Insert a lane to the right">▸+</button>
             <button data-act="del" title="Remove this lane">✕</button></span>` : ''}
+        </div>
+        <div class="two">
+          <label>Type
+            <select data-k="@kind">${LANE_KINDS.map((k) => `<option value="${k}" ${laneKind(l) === k ? 'selected' : ''}>${KIND_NAME[k]}</option>`).join('')}</select></label>
+          <label>Max speed
+            <input data-k="maxspeed" value="${h(l.maxspeed)}" placeholder="road's"></label>
         </div>
         <div class="turns">
           ${TURN_VALUES.map((t) => `<button class="chip ${turns.has(t) ? 'on' : ''}" data-act="turn" data-v="${t}" title="${t}">${TURN_GLYPH[t]}</button>`).join('')}
@@ -264,12 +296,28 @@ export class LaneEditor {
   private onInput(e: Event) {
     const el = e.target as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
     if (el.matches('[data-act="both"]')) return; // handled by click
-    const k = el.dataset.k as LaneKey | undefined;
+    if (el.dataset.side && this.way) {
+      const left = parseRoadside(this.way.tags, 'left');
+      const right = parseRoadside(this.way.tags, 'right');
+      const r = el.dataset.side === 'left' ? left : right;
+      const f = el.dataset.f as keyof Roadside;
+      if (f === 'shoulder') r.shoulder = (el as HTMLInputElement).checked;
+      else r[f] = el.value;
+      this.onChange(this.way.id, writeRoadside(this.way.tags, left, right));
+      return;
+    }
+    const k = el.dataset.k as LaneKey | '@kind' | undefined;
     const card = el.closest<HTMLElement>('.lane');
     if (!k || !card || !this.model) return;
     const lane = this.laneAt(card.dataset.dir!, Number(card.dataset.i));
     if (!lane) return;
     let v = el.value;
+    if (k === '@kind') {
+      setLaneKind(lane, v as LaneKind);
+      this.focus = { dir: card.dataset.dir as LaneRef['dir'], index: Number(card.dataset.i) };
+      setTimeout(() => this.commit(), 0);
+      return;
+    }
     if (k === 'destination') v = v.split('\n').map((s) => s.trim()).filter(Boolean).join(';');
     lane[k] = v.trim();
     this.focus = { dir: card.dataset.dir as LaneRef['dir'], index: Number(card.dataset.i) };

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { layoutLanes, mayChange, parseRoad, validate, writeRoad } from '../src/lanes.ts';
+import { emptyLane, laneKind, layoutLanes, layoutSide, mayChange, parseRoad, parseRoadside, setLaneKind, validate, writeRoad, writeRoadside } from '../src/lanes.ts';
 
 test('parses a one-way road with turn and destination lanes', () => {
   const m = parseRoad({
@@ -51,7 +51,7 @@ test('round-trip write is stable and drops empty per-lane tags', () => {
 test('adding a lane on a two-way road writes forward/backward counts', () => {
   const tags = { highway: 'tertiary', lanes: '2' };
   const m = parseRoad(tags);
-  m.forward.push({ turn: 'right', destination: '', 'destination:ref': '', change: '', width: '' });
+  m.forward.push({ ...emptyLane(), turn: 'right' });
   m.forward[0].turn = 'through';
   const out = writeRoad(tags, m);
   assert.equal(out.lanes, '3');
@@ -106,7 +106,7 @@ test('layout respects driving side and placement', () => {
 });
 
 test('change semantics', () => {
-  const l = { turn: '', destination: '', 'destination:ref': '', change: 'not_left', width: '' };
+  const l = { ...emptyLane(), change: 'not_left' };
   assert.equal(mayChange(l, 'left'), false);
   assert.equal(mayChange(l, 'right'), true);
 });
@@ -115,4 +115,53 @@ test('validation flags count mismatch and bad values', () => {
   const w = validate({ highway: 'primary', oneway: 'yes', lanes: '2', 'turn:lanes': 'left|through|rihgt' });
   assert.ok(w.some((x) => x.text.includes('has 3 values, expected 2')));
   assert.ok(w.some((x) => x.text.includes('rihgt')));
+});
+
+test('unknown per-lane keys stay aligned when a lane is inserted', () => {
+  const tags = { highway: 'primary', oneway: 'yes', lanes: '2', 'hgv:lanes': 'no|yes', 'turn:lanes': 'left|through' };
+  const m = parseRoad(tags);
+  m.forward.splice(1, 0, emptyLane());
+  const out = writeRoad(tags, m);
+  assert.equal(out.lanes, '3');
+  assert.equal(out['hgv:lanes'], 'no||yes');
+  assert.equal(out['turn:lanes'], 'left||through');
+});
+
+test('ambiguous plain *:lanes on a two-way road is left untouched', () => {
+  const tags = { highway: 'primary', lanes: '2', 'bus:lanes': 'yes|designated' };
+  const out = writeRoad(tags, parseRoad(tags));
+  assert.equal(out['bus:lanes'], 'yes|designated');
+});
+
+test('lane kinds', () => {
+  const tags = { highway: 'primary', oneway: 'yes', lanes: '3', 'bus:lanes': 'no|no|designated', 'vehicle:lanes': 'yes|no|no', 'taxi:lanes': '|yes|' };
+  const m = parseRoad(tags);
+  assert.deepEqual(m.forward.map((l) => laneKind(l)), ['general', 'taxi', 'bus']);
+  setLaneKind(m.forward[0], 'bicycle');
+  setLaneKind(m.forward[2], 'general');
+  const out = writeRoad(tags, m);
+  assert.equal(out['bicycle:lanes'], 'designated||');
+  assert.equal(out['bus:lanes'], 'no|no|');
+  assert.equal(out['vehicle:lanes'], 'yes|no|');
+  const r = emptyLane();
+  setLaneKind(r, 'restricted');
+  assert.equal(laneKind(r), 'restricted');
+});
+
+test('roadside read and write', () => {
+  const tags = { highway: 'residential', sidewalk: 'left', 'cycleway:both': 'lane', 'parking:right': 'lane', shoulder: 'no' };
+  const l = parseRoadside(tags, 'left');
+  const r = parseRoadside(tags, 'right');
+  assert.deepEqual([l.sidewalk, r.sidewalk, l.cycleway, r.parking], ['yes', 'no', 'lane', 'lane']);
+  assert.deepEqual(writeRoadside(tags, l, r), tags);
+  r.sidewalk = 'yes';
+  l.cycleway = 'track';
+  const out = writeRoadside(tags, l, r);
+  assert.equal(out.sidewalk, 'both');
+  assert.equal(out['cycleway:left'], 'track');
+  assert.equal(out['cycleway:right'], 'lane');
+  assert.equal(out['cycleway:both'], undefined);
+  const strips = layoutSide(out, 'right', 3);
+  assert.deepEqual(strips.map((s) => s.kind), ['cycle', 'parking', 'sidewalk']);
+  assert.equal(strips[0].left, 3);
 });

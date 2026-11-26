@@ -198,3 +198,125 @@ export function signTexture(s: SignContent): THREE.CanvasTexture {
   signCache.set(key, tex);
   return tex;
 }
+
+// ---------------------------------------------------------------------------
+// Lane symbols and small street furniture faces.
+
+const miscCache = new Map<string, THREE.CanvasTexture>();
+
+function cached(key: string, w: number, h: number, draw: (g: CanvasRenderingContext2D) => void): THREE.CanvasTexture {
+  const hit = miscCache.get(key);
+  if (hit) return hit;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  draw(c.getContext('2d')!);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 8;
+  miscCache.set(key, tex);
+  return tex;
+}
+
+/** Painted road text ("BUS", "30"), stretched along the lane like real carriageway lettering. */
+export function roadTextTexture(text: string): THREE.CanvasTexture {
+  return cached('text:' + text, 128, 256, (g) => {
+    g.fillStyle = '#f4f4f0';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.font = `bold ${text.length > 3 ? 44 : 56}px system-ui, sans-serif`;
+    g.translate(64, 128);
+    g.scale(1, 3.4);
+    g.fillText(text, 0, 0);
+  });
+}
+
+/** Painted bicycle symbol. */
+export function bikeTexture(): THREE.CanvasTexture {
+  return cached('bike', 128, 256, (g) => {
+    g.strokeStyle = '#f4f4f0';
+    g.lineWidth = 9;
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+    // Seen from above the lane, the bike is drawn side-on and stretched along the lane.
+    g.translate(64, 128);
+    g.scale(1, 1.7);
+    const wheel = (x: number, y: number) => {
+      g.beginPath();
+      g.arc(x, y, 20, 0, Math.PI * 2);
+      g.stroke();
+    };
+    wheel(-30, 30);
+    wheel(30, 30);
+    g.beginPath();
+    g.moveTo(-30, 30);
+    g.lineTo(-8, -6);
+    g.lineTo(22, -6);
+    g.lineTo(30, 30);
+    g.moveTo(-8, -6);
+    g.lineTo(4, 30);
+    g.lineTo(22, -6);
+    g.moveTo(-14, -18);
+    g.lineTo(-2, -18);
+    g.moveTo(22, -6);
+    g.lineTo(18, -24);
+    g.lineTo(30, -24);
+    g.stroke();
+  });
+}
+
+/** Front of a three-aspect traffic signal head. */
+export function signalTexture(): THREE.CanvasTexture {
+  return cached('signal', 64, 192, (g) => {
+    g.fillStyle = '#16181a';
+    g.fillRect(0, 0, 64, 192);
+    const lamp = (y: number, c: string) => {
+      g.fillStyle = c;
+      g.beginPath();
+      g.arc(32, y, 22, 0, Math.PI * 2);
+      g.fill();
+    };
+    lamp(34, '#e53935');
+    lamp(96, '#5a4a1c');
+    lamp(158, '#1f4a2a');
+  });
+}
+
+/** Face of a stop or give-way sign (transparent outside the sign shape). */
+export function signFaceTexture(kind: 'stop' | 'give_way'): THREE.CanvasTexture {
+  return cached('face:' + kind, 128, 128, (g) => {
+    if (kind === 'stop') {
+      g.fillStyle = '#c62828';
+      g.beginPath();
+      for (let i = 0; i < 8; i++) {
+        const a = Math.PI / 8 + (i * Math.PI) / 4;
+        g.lineTo(64 + Math.cos(a) * 60, 64 + Math.sin(a) * 60);
+      }
+      g.closePath();
+      g.fill();
+      g.strokeStyle = '#fff';
+      g.lineWidth = 5;
+      g.stroke();
+      g.fillStyle = '#fff';
+      g.font = 'bold 38px system-ui, sans-serif';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillText('STOP', 64, 66);
+    } else {
+      g.fillStyle = '#c62828';
+      g.beginPath();
+      g.moveTo(4, 10);
+      g.lineTo(124, 10);
+      g.lineTo(64, 118);
+      g.closePath();
+      g.fill();
+      g.fillStyle = '#fff';
+      g.beginPath();
+      g.moveTo(26, 24);
+      g.lineTo(102, 24);
+      g.lineTo(64, 92);
+      g.closePath();
+      g.fill();
+    }
+  });
+}
